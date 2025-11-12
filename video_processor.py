@@ -53,9 +53,13 @@ def process_video(video_path, output_path, progress_callback):
     stopped_frames_count, is_car_stopped, stop_start_frame = 0, False, 0
     is_car_on_ground = False
     
-    ACTIVITY_THRESHOLD = 25
+    # --- Hysteresis Thresholds ---
+    REFUEL_START_THRESHOLD = 30 # Higher threshold to start refueling
+    REFUEL_STOP_THRESHOLD = 20  # Lower threshold to stop refueling
+    
     MIN_TIRE_OVERLAP_AREA = 500
     total_stopped_time, tire_change_time, refuel_time = 0.0, 0.0, 0.0
+    is_refueling_state = False # "Sticky" state for refueling
 
     for frame_count in range(total_frames):
         ret, frame = cap.read()
@@ -88,7 +92,7 @@ def process_video(video_path, output_path, progress_callback):
         if not car_is_moving and not is_car_stopped:
             is_car_stopped, stop_start_frame, is_car_on_ground = True, frame_count, False
         elif car_is_moving and is_car_stopped:
-            is_car_stopped = False
+            is_car_stopped, is_refueling_state = False, False
             total_stopped_time += (frame_count - stop_start_frame) / fps
             stop_start_frame = 0
 
@@ -97,21 +101,22 @@ def process_video(video_path, output_path, progress_callback):
             if sum(boxes_overlap_area(p, t) for p in person_bboxes for t in tire_rois) > MIN_TIRE_OVERLAP_AREA:
                 tire_change_time += 1/fps
 
-            # --- Simplified Refueling Detection ---
-            is_refueling = False
-            if is_car_on_ground:
-                current_refuel_sig = get_patch_signature(frame, refuel_roi_on_ground)
-                if np.linalg.norm(current_refuel_sig - baseline_sig_refuel_ground) > ACTIVITY_THRESHOLD:
-                    is_refueling = True
-            else:
-                current_refuel_sig = get_patch_signature(frame, refuel_roi_in_air)
-                if np.linalg.norm(current_refuel_sig - baseline_sig_refuel_air) > ACTIVITY_THRESHOLD:
-                    is_refueling = True
+            # --- Hysteresis Refueling Detection ---
+            current_refuel_roi = refuel_roi_on_ground if is_car_on_ground else refuel_roi_in_air
+            baseline_refuel_sig = baseline_sig_refuel_ground if is_car_on_ground else baseline_sig_refuel_air
+            current_refuel_sig = get_patch_signature(frame, current_refuel_roi)
+            refuel_activity_diff = np.linalg.norm(current_refuel_sig - baseline_refuel_sig)
+
+            if not is_refueling_state and refuel_activity_diff > REFUEL_START_THRESHOLD:
+                is_refueling_state = True # Start refueling
+            elif is_refueling_state and refuel_activity_diff < REFUEL_STOP_THRESHOLD:
+                is_refueling_state = False # Stop refueling
+            # If diff is between thresholds, the state remains unchanged.
             
-            if is_refueling:
+            if is_refueling_state:
                 refuel_time += 1 / fps
 
-        # --- Simplified Drawing Logic ---
+        # --- Drawing Logic ---
         cv2.rectangle(annotated_frame, ref_roi, (0, 255, 255), 2)
         for roi in tire_rois: cv2.rectangle(annotated_frame, roi, (255, 255, 0), 2)
         cv2.rectangle(annotated_frame, refuel_roi_in_air, (0, 0, 255), 2)
