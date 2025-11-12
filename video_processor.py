@@ -3,14 +3,19 @@ import numpy as np
 import os
 from ultralytics import YOLO
 
-def get_patch_signature(frame, roi):
-    """Calculates a simple signature (mean color) of a region."""
+def get_patch_histogram(frame, roi):
+    """Calculates a color histogram for a region."""
     h, w = frame.shape[:2]
     x1, y1, x2, y2 = max(0, int(roi[0])), max(0, int(roi[1])), min(w, int(roi[2])), min(h, int(roi[3]))
     patch = frame[y1:y2, x1:x2]
     if patch.size == 0:
-        return np.array([0, 0, 0])
-    return np.mean(patch, axis=(0, 1))
+        return None
+    
+    # Calculate histogram for the patch
+    hist = cv2.calcHist([patch], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+    # Normalize the histogram
+    cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+    return hist
 
 def boxes_overlap_area(box1, box2):
     """Calculates the area of overlap between two boxes."""
@@ -35,11 +40,11 @@ def process_video(video_path, output_path, progress_callback):
     refuel_roi_in_air = (803, 328, 920, 460)
     refuel_roi_on_ground = (refuel_roi_in_air[0], refuel_roi_in_air[1] + 20, refuel_roi_in_air[2], refuel_roi_in_air[3] + 20)
 
-    # --- Calculate Baseline Signatures for Refueling from car.png ---
-    baseline_sig_refuel_air = get_patch_signature(baseline_img, refuel_roi_in_air)
+    # --- Calculate Baseline HISTOGRAMS from car.png ---
+    baseline_hist_refuel_air = get_patch_histogram(baseline_img, refuel_roi_in_air)
     M = np.float32([[1, 0, 0], [0, 1, 20]])
     shifted_baseline = cv2.warpAffine(baseline_img, M, (baseline_img.shape[1], baseline_img.shape[0]))
-    baseline_sig_refuel_ground = get_patch_signature(shifted_baseline, refuel_roi_on_ground)
+    baseline_hist_refuel_ground = get_patch_histogram(shifted_baseline, refuel_roi_on_ground)
 
     cap = cv2.VideoCapture(video_path)
     width, height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -53,13 +58,14 @@ def process_video(video_path, output_path, progress_callback):
     stopped_frames_count, is_car_stopped, stop_start_frame = 0, False, 0
     is_car_on_ground = False
     
-    # --- Hysteresis Thresholds ---
-    REFUEL_START_THRESHOLD = 30 # Higher threshold to start refueling
-    REFUEL_STOP_THRESHOLD = 20  # Lower threshold to stop refueling
+    # --- Hysteresis Thresholds for Histogram Comparison ---
+    # Correlation is higher when similar. So we start when correlation drops, stop when it rises.
+    REFUEL_START_CORREL_THRESH = 0.7  # Start if correlation to baseline is LESS than this
+    REFUEL_STOP_CORREL_THRESH = 0.85 # Stop if correlation to baseline is GREATER than this
     
     MIN_TIRE_OVERLAP_AREA = 500
     total_stopped_time, tire_change_time, refuel_time = 0.0, 0.0, 0.0
-    is_refueling_state = False # "Sticky" state for refueling
+    is_refueling_state = False
 
     for frame_count in range(total_frames):
         ret, frame = cap.read()
@@ -101,17 +107,19 @@ def process_video(video_path, output_path, progress_callback):
             if sum(boxes_overlap_area(p, t) for p in person_bboxes for t in tire_rois) > MIN_TIRE_OVERLAP_AREA:
                 tire_change_time += 1/fps
 
-            # --- Hysteresis Refueling Detection ---
+            # --- Histogram Refueling Detection ---
             current_refuel_roi = refuel_roi_on_ground if is_car_on_ground else refuel_roi_in_air
-            baseline_refuel_sig = baseline_sig_refuel_ground if is_car_on_ground else baseline_sig_refuel_air
-            current_refuel_sig = get_patch_signature(frame, current_refuel_roi)
-            refuel_activity_diff = np.linalg.norm(current_refuel_sig - baseline_refuel_sig)
+            baseline_refuel_hist = baseline_hist_refuel_ground if is_car_on_ground else baseline_hist_refuel_air
+            current_refuel_hist = get_patch_histogram(frame, current_refuel_roi)
 
-            if not is_refueling_state and refuel_activity_diff > REFUEL_START_THRESHOLD:
-                is_refueling_state = True # Start refueling
-            elif is_refueling_state and refuel_activity_diff < REFUEL_STOP_THRESHOLD:
-                is_refueling_state = False # Stop refueling
-            # If diff is between thresholds, the state remains unchanged.
+            if current_refuel_hist is not None:
+                # Compare histograms using Correlation
+                correlation = cv2.compareHist(baseline_refuel_hist, current_refuel_hist, cv2.HISTCMP_CORREL)
+                
+                if not is_refueling_state and correlation < REFUEL_START_CORREL_THRESH:
+                    is_refueling_state = True
+                elif is_refueling_state and correlation > REFUEL_STOP_CORREL_THRESH:
+                    is_refueling_state = False
             
             if is_refueling_state:
                 refuel_time += 1 / fps
