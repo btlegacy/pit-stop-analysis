@@ -52,9 +52,10 @@ def process_video(video_path, output_path, progress_callback):
     MIN_TIRE_OVERLAP_AREA = 500
     total_stopped_time, tire_change_time, refuel_time = 0.0, 0.0, 0.0
     
-    # --- Adaptive Tracker State ---
-    refuel_tracker = None
+    # --- Custom Tracker State ---
+    refuel_bbox = None # Will store (x, y, w, h) of the probe
     is_refueling_state = False
+    TRACK_LOST_THRESHOLD = 0.6 # If match score drops below this, we lose the lock
 
     for frame_count in range(total_frames):
         ret, frame = cap.read()
@@ -68,7 +69,7 @@ def process_video(video_path, output_path, progress_callback):
             unobstructed_signature = get_patch_signature(frame, ref_roi)
 
         current_car_stop_sig = get_patch_signature(frame, ref_roi)
-        # Car stop logic
+        # (Car stop logic remains the same)
         is_obstructed = np.linalg.norm(current_car_stop_sig - unobstructed_signature) > CAR_STOP_THRESH
         car_is_moving = True
         if is_obstructed:
@@ -83,7 +84,7 @@ def process_video(video_path, output_path, progress_callback):
         if not car_is_moving and not is_car_stopped:
             is_car_stopped, stop_start_frame = True, frame_count
         elif car_is_moving and is_car_stopped:
-            is_car_stopped, is_refueling_state, refuel_tracker = False, False, None
+            is_car_stopped, is_refueling_state, refuel_bbox = False, False, None
             total_stopped_time += (frame_count - stop_start_frame) / fps
             stop_start_frame = 0
 
@@ -92,8 +93,8 @@ def process_video(video_path, output_path, progress_callback):
             if sum(boxes_overlap_area(p, t) for p in person_bboxes for t in tire_rois) > MIN_TIRE_OVERLAP_AREA:
                 tire_change_time += 1/fps
 
-            # --- Adaptive Refueling Logic ---
-            if refuel_tracker is None: 
+            # --- Custom "Track-by-Search" Refueling Logic ---
+            if refuel_bbox is None: # We haven't locked on yet
                 x, y, w, h = refuel_roi_in_air
                 search_area = cv2.cvtColor(frame[int(y):int(y+h), int(x):int(x+w)], cv2.COLOR_BGR2GRAY)
                 
@@ -102,21 +103,30 @@ def process_video(video_path, output_path, progress_callback):
                 
                 if score_in > score_out and score_in > 0.7:
                     is_refueling_state = True
-                    # --- Initialize Tracker ---
-                    print("Probe detected. Initializing MedianFlow tracker.")
-                    tracker_roi = (x + max_loc_in[0], y + max_loc_in[1], probe_in_template.shape[1], probe_in_template.shape[0])
-                    refuel_tracker = cv2.legacy.TrackerMedianFlow_create()
-                    refuel_tracker.init(frame, tracker_roi)
-            else: # Tracker is active
-                success, bbox = refuel_tracker.update(frame)
-                if success:
+                    # Lock On: Store the bounding box of the probe
+                    ph, pw = probe_in_template.shape
+                    refuel_bbox = (x + max_loc_in[0], y + max_loc_in[1], pw, ph)
+            else: # We have a lock, now track it
+                # Define a search window around the last known position
+                search_pad = 40
+                x, y, w, h = refuel_bbox
+                sx1, sy1 = max(0, int(x - search_pad)), max(0, int(y - search_pad))
+                sx2, sy2 = min(width, int(x + w + search_pad)), min(height, int(y + h + search_pad))
+                search_window = frame[sy1:sy2, sx1:sx2]
+                
+                res = cv2.matchTemplate(search_window, probe_in_template, cv2.TM_CCOEFF_NORMED)
+                _, score, _, max_loc = cv2.minMaxLoc(res)
+                
+                if score > TRACK_LOST_THRESHOLD:
                     is_refueling_state = True
-                    p1 = (int(bbox[0]), int(bbox[1]))
-                    p2 = (int(bbox[0] + bbox[2]), int(bbox[1] + bbox[3]))
-                    cv2.rectangle(annotated_frame, p1, p2, (255, 0, 255), 3, 1) # Draw magenta box for tracked probe
-                else:
+                    # Update the bounding box to the new location
+                    refuel_bbox = (sx1 + max_loc[0], sy1 + max_loc[1], w, h)
+                    p1 = (int(refuel_bbox[0]), int(refuel_bbox[1]))
+                    p2 = (int(refuel_bbox[0] + refuel_bbox[2]), int(refuel_bbox[1] + refuel_bbox[3]))
+                    cv2.rectangle(annotated_frame, p1, p2, (255, 0, 255), 3, 1) # Draw magenta box
+                else: # We lost the lock
                     is_refueling_state = False
-                    refuel_tracker = None # Tracker lost the object
+                    refuel_bbox = None
             
             if is_refueling_state:
                 refuel_time += 1 / fps
