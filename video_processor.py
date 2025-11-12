@@ -113,7 +113,7 @@ def process_video(video_path, output_path, progress_callback):
         cv2.rectangle(annotated_frame, (ref_roi[0], ref_roi[1]), (ref_roi[2], ref_roi[3]), (0, 255, 255), 2) # Yellow ref box
         for roi in tire_rois:
             cv2.rectangle(annotated_frame, (roi[0], roi[1]), (roi[2], roi[3]), (255, 255, 0), 2)
-        cv2.rectangle(annotated_frame, (refuel_roi[0], refuel_roi[1]), (refuel_roi[2], ref_roi[3]), (0, 0, 255), 2)
+        cv2.rectangle(annotated_frame, (refuel_roi[0], refuel_roi[1]), (refuel_roi[2], refuel_roi[3]), (0, 0, 255), 2)
 
         current_display_stopped_time = total_stopped_time + ((frame_count - stop_start_frame) / fps if is_car_stopped else 0)
         cv2.putText(annotated_frame, f'Car Stopped: {current_display_stopped_time:.2f}s', (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
@@ -127,7 +127,6 @@ def process_video(video_path, output_path, progress_callback):
 
     cap.release()
     out.release()
-    cv2.destroyAllWindows()
     
     return total_stopped_time, tire_change_time, refuel_time
 
