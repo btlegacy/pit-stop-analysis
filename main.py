@@ -32,16 +32,25 @@ def main():
                 def update_progress(percentage):
                     progress_bar.progress(int(percentage * 100), text=f"Processing... {int(percentage * 100)}%")
 
-                total_stopped_time, tire_change_time, refuel_time = process_video(input_path, output_path, update_progress)
+                results = process_video(input_path, output_path, update_progress)
+                total_stopped_time, tire_change_time, refuel_in_air, refuel_on_ground = results
+                total_refuel_time = refuel_in_air + refuel_on_ground
                 
                 progress_bar.progress(100, text="Analysis Complete!")
                 st.success("Analysis Complete!")
 
-                # Display metrics
+                # --- Display Metrics ---
+                st.subheader("Pit Stop Statistics")
                 col1, col2, col3 = st.columns(3)
                 col1.metric("Total Stop Time", f"{total_stopped_time:.2f}s")
                 col2.metric("Tire Change Time", f"{tire_change_time:.2f}s")
-                col3.metric("Refueling Time", f"{refuel_time:.2f}s")
+                col3.metric("Total Refueling Time", f"{total_refuel_time:.2f}s")
+
+                st.write("---")
+                st.write(f"**Refueling Breakdown:**")
+                st.text(f"  - In Air: {refuel_in_air:.2f}s")
+                st.text(f"  - On Ground: {refuel_on_ground:.2f}s")
+
 
                 st.video(output_path)
 
