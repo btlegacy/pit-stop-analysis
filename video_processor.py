@@ -27,18 +27,19 @@ def process_video(video_path, output_path, progress_callback):
     model = YOLO('yolov8n.pt')
 
     # --- Load Fuel Nozzle Template ---
-    template_path = 'refs/fuelnozzle.png'
+    template_path = 'refs/fuelerpluggedin.png'  # Use the new, more accurate template
     if not os.path.exists(template_path):
         print(f"Error: Fuel nozzle template not found at {template_path}")
+        print("Please ensure 'fuelerpluggedin.png' is in the 'refs' directory.")
         return None, None, None
     fuel_nozzle_template = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
     if fuel_nozzle_template is None:
         print(f"Error: Could not read template image from {template_path}")
         return None, None, None
+    print(f"Successfully loaded fuel nozzle template from {template_path}") # Debug message
     
     # Open the video file
     cap = cv2.VideoCapture(video_path)
-    # (rest of video loading properties...)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
@@ -62,7 +63,7 @@ def process_video(video_path, output_path, progress_callback):
         (685, 10, 830, 100), (685, 430, 780, 500)
     ]
     refuel_roi = (803, 328, 920, 460)
-    MIN_TIRE_OVERLAP_AREA = 500 # Minimum pixel area for tire change to count
+    MIN_TIRE_OVERLAP_AREA = 500
 
     # --- Template Matching Threshold ---
     NOZZLE_MATCH_THRESHOLD = 0.7
@@ -105,26 +106,29 @@ def process_video(video_path, output_path, progress_callback):
         if is_car_stopped:
             person_bboxes = [box.xyxy[0].cpu().numpy() for box in results[0].boxes if int(box.cls) == 0] if results[0].boxes and results[0].boxes.id is not None else []
             
-            # Tire change logic with overlap area
             total_overlap = sum(boxes_overlap_area(p, t) for p in person_bboxes for t in tire_rois)
             if total_overlap > MIN_TIRE_OVERLAP_AREA:
                 tire_change_time += 1 / fps
 
             # --- Fuel nozzle logic with template matching ---
             x, y, w, h = refuel_roi[0], refuel_roi[1], refuel_roi[2]-refuel_roi[0], refuel_roi[3]-refuel_roi[1]
-            refuel_search_area = frame[y:y+h, x:x+w]
-            refuel_search_area_gray = cv2.cvtColor(refuel_search_area, cv2.COLOR_BGR2GRAY)
-            
-            match_result = cv2.matchTemplate(refuel_search_area_gray, fuel_nozzle_template, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, _ = cv2.minMaxLoc(match_result)
+            if h > 0 and w > 0:
+                refuel_search_area = frame[y:y+h, x:x+w]
+                refuel_search_area_gray = cv2.cvtColor(refuel_search_area, cv2.COLOR_BGR2GRAY)
+                
+                # Ensure template is not larger than search area
+                if refuel_search_area_gray.shape[0] >= fuel_nozzle_template.shape[0] and \
+                   refuel_search_area_gray.shape[1] >= fuel_nozzle_template.shape[1]:
+                    match_result = cv2.matchTemplate(refuel_search_area_gray, fuel_nozzle_template, cv2.TM_CCOEFF_NORMED)
+                    _, max_val, _, _ = cv2.minMaxLoc(match_result)
 
-            if max_val > NOZZLE_MATCH_THRESHOLD:
-                refuel_time += 1 / fps
+                    if max_val > NOZZLE_MATCH_THRESHOLD:
+                        refuel_time += 1 / fps
 
         # --- Draw ROIs and Stats ---
         cv2.rectangle(annotated_frame, (ref_roi[0], ref_roi[1]), (ref_roi[2], ref_roi[3]), (0, 255, 255), 2)
         for roi in tire_rois: cv2.rectangle(annotated_frame, (roi[0], roi[1]), (roi[2], roi[3]), (255, 255, 0), 2)
-        cv2.rectangle(annotated_frame, (refuel_roi[0], refuel_roi[1]), (refuel_roi[2], refuel_roi[3]), (0, 0, 255), 2)
+        cv2.rectangle(annotated_frame, (refuel_roi[0], ref_roi[1]), (ref_roi[2], ref_roi[3]), (0, 0, 255), 2)
 
         current_display_stopped_time = total_stopped_time + ((frame_count - stop_start_frame) / fps if is_car_stopped else 0)
         cv2.putText(annotated_frame, f'Car Stopped: {current_display_stopped_time:.2f}s', (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
