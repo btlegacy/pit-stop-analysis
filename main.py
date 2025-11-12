@@ -1,44 +1,55 @@
-import tkinter as tk
-from tkinter import filedialog
+import streamlit as st
 from video_processor import process_video
+import tempfile
 import os
 
 def main():
-    # Set up the root Tkinter window
-    root = tk.Tk()
-    root.withdraw()  # Hide the main window
+    st.title("🏎️ Pit Stop Analysis")
 
-    # Open a dialog to ask for the input video file
-    video_path = filedialog.askopenfilename(
-        title="Select a Pit Stop Video",
-        filetypes=(("Video Files", "*.mp4 *.avi *.mov"), ("All files", "*.*"))
+    st.write("""
+    Upload a video of a pit stop to analyze the total stop time, 
+    tire changing time, and refueling time.
+    """)
+
+    # File uploader widget
+    uploaded_file = st.file_uploader(
+        "Choose a video...", 
+        type=["mp4", "mov", "avi"]
     )
 
-    # If the user selected a file, proceed
-    if video_path:
-        # Suggest a default output filename
-        input_dir, input_filename = os.path.split(video_path)
-        output_filename = os.path.splitext(input_filename)[0] + "_analyzed.mp4"
-        
-        # Open a dialog to ask where to save the output video
-        output_path = filedialog.asksaveasfilename(
-            title="Save Analyzed Video As...",
-            initialdir=input_dir,
-            initialfile=output_filename,
-            defaultextension=".mp4",
-            filetypes=(("MP4 files", "*.mp4"),)
-        )
-        
-        # If the user confirmed the save location, start processing
-        if output_path:
-            print(f"Input video: {video_path}")
-            print(f"Output will be saved to: {output_path}")
-            print("Processing, please wait...")
-            process_video(video_path, output_path)
-        else:
-            print("Save operation cancelled.")
-    else:
-        print("No video selected.")
+    if uploaded_file is not None:
+        # Create a temporary directory to store files
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Get the path for the uploaded and output files
+            input_path = os.path.join(temp_dir, uploaded_file.name)
+            output_path = os.path.join(temp_dir, "analyzed_video.mp4")
+
+            # Write the uploaded file to the temp directory
+            with open(input_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+
+            # Display the uploaded video
+            st.video(input_path)
+
+            # A button to start the analysis
+            if st.button("Analyze Video"):
+                # A placeholder and progress bar for user feedback
+                with st.spinner("Processing... This may take a moment."):
+                    process_video(input_path, output_path)
+
+                st.success("Analysis Complete!")
+                
+                # Display the processed video
+                st.video(output_path)
+
+                # Provide a download button for the analyzed video
+                with open(output_path, "rb") as file:
+                    st.download_button(
+                        label="Download Analyzed Video",
+                        data=file,
+                        file_name="analyzed_video.mp4",
+                        mime="video/mp4"
+                    )
 
 if __name__ == '__main__':
     main()
