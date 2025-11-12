@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-def process_video(video_path, output_path):
+def process_video(video_path, output_path, progress_callback):
     # Load the YOLOv8 model
     model = YOLO('yolov8n.pt')
 
@@ -10,50 +10,47 @@ def process_video(video_path, output_path):
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         print(f"Error: Could not open video {video_path}")
-        return
+        return None, None, None
 
     # Get video properties
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     # Define the codec and create VideoWriter object
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
     # --- Analysis Variables ---
-    car_positions = []
     is_car_stopped = False
-    stop_start_time = 0
-    total_stopped_time = 0
+    stop_start_frame = 0
+    total_stopped_time = 0.0
+    
+    tire_change_time = 0.0
+    refuel_time = 0.0
 
-    tire_change_time = 0
-    refuel_time = 0
+    last_car_center = None
+    stopped_frames_count = 0
+    MOVEMENT_THRESHOLD = 5  # pixels
+    STOPPED_CONFIRMATION_FRAMES = int(fps / 4) # Require 1/4 second of no movement to confirm stop
 
-    # Regions of Interest (ROIs) based on user-provided coordinates
-    # Format: (x_min, y_min, x_max, y_max)
+    # Regions of Interest (ROIs) from user
     tire_rois = [
-        (1210, 30, 1370, 150),   # Left Front Tire
-        (1210, 400, 1400, 550),  # Right Front Tire
-        (685, 10, 830, 100),    # Left Rear Tire
-        (685, 430, 780, 500)     # Right Rear Tire
+        (1210, 30, 1370, 150), (1210, 400, 1400, 550),
+        (685, 10, 830, 100), (685, 430, 780, 500)
     ]
-    refuel_roi = (803, 328, 920, 460) # Fuel Area
+    refuel_roi = (803, 328, 920, 460)
 
-    frame_count = 0
-
-    while cap.isOpened():
+    for frame_count in range(total_frames):
         ret, frame = cap.read()
         if not ret:
             break
 
-        frame_count += 1
-        current_time_sec = frame_count / fps
+        # Update progress
+        progress_callback(frame_count / total_frames)
 
-        # Run YOLOv8 tracking on the frame
-        results = model.track(frame, persist=True, classes=[2, 0]) # 2 is car, 0 is person
-
-        # Get the annotated frame
+        results = model.track(frame, persist=True, classes=[2, 0], verbose=False)
         annotated_frame = results[0].plot()
         
         car_bbox = None
@@ -61,76 +58,73 @@ def process_video(video_path, output_path):
 
         if results[0].boxes is not None and results[0].boxes.id is not None:
             for box in results[0].boxes:
-                cls_id = int(box.cls)
-                if cls_id == 2: # Car
+                if int(box.cls) == 2:  # Car
                     car_bbox = box.xyxy[0].cpu().numpy()
-                elif cls_id == 0: # Person
+                elif int(box.cls) == 0:  # Person
                     person_bboxes.append(box.xyxy[0].cpu().numpy())
 
-        # --- Car Stopped Logic ---
+        # --- New Car Stopped Logic ---
+        car_is_moving = True
         if car_bbox is not None:
-            car_center_x = (car_bbox[0] + car_bbox[2]) / 2
-            car_positions.append(car_center_x)
+            car_center = ((car_bbox[0] + car_bbox[2]) / 2, (car_bbox[1] + car_bbox[3]) / 2)
+            
+            if last_car_center is not None:
+                distance = np.sqrt((car_center[0] - last_car_center[0])**2 + (car_center[1] - last_car_center[1])**2)
+                if distance < MOVEMENT_THRESHOLD:
+                    stopped_frames_count += 1
+                else:
+                    stopped_frames_count = 0
+            
+            last_car_center = car_center
+            
+            if stopped_frames_count > STOPPED_CONFIRMATION_FRAMES:
+                car_is_moving = False
 
-            if len(car_positions) > int(fps * 0.5): # Analyze last 0.5 seconds
-                car_positions.pop(0)
-                movement = np.std(car_positions)
+        if not car_is_moving and not is_car_stopped:
+            # Car just stopped
+            is_car_stopped = True
+            stop_start_frame = frame_count
+        elif car_is_moving and is_car_stopped:
+            # Car just started moving again
+            is_car_stopped = False
+            total_stopped_time += (frame_count - stop_start_frame) / fps
+            stop_start_frame = 0
 
-                if movement < 2.0 and not is_car_stopped: # Threshold for stopped
-                    is_car_stopped = True
-                    stop_start_time = current_time_sec
-                elif movement >= 2.0 and is_car_stopped:
-                    is_car_stopped = False
-                    total_stopped_time += (current_time_sec - stop_start_time)
-                    stop_start_time = 0
-        
-        # --- Tire Change and Refuel Logic (if car is stopped) ---
+        # --- Tire Change and Refuel Logic (only when car is stopped) ---
         if is_car_stopped:
-            in_tire_roi = False
-            for p_bbox in person_bboxes:
-                for t_roi in tire_rois:
-                    if boxes_overlap(p_bbox, t_roi):
-                        in_tire_roi = True
-                        break
-            if in_tire_roi:
+            person_in_tire_roi = any(boxes_overlap(p_bbox, t_roi) for p_bbox in person_bboxes for t_roi in tire_rois)
+            if person_in_tire_roi:
                 tire_change_time += 1 / fps
 
-            in_refuel_roi = False
-            for p_bbox in person_bboxes:
-                 if boxes_overlap(p_bbox, refuel_roi):
-                    in_refuel_roi = True
-                    break
-            if in_refuel_roi:
-                 refuel_time += 1/fps
-
+            person_in_refuel_roi = any(boxes_overlap(p_bbox, refuel_roi) for p_bbox in person_bboxes)
+            if person_in_refuel_roi:
+                refuel_time += 1 / fps
 
         # --- Draw ROIs and Stats ---
         for roi in tire_rois:
-            cv2.rectangle(annotated_frame, (roi[0], roi[1]), (roi[2], roi[3]), (255, 255, 0), 2) # Turquoise
-            cv2.putText(annotated_frame, 'Tire Area', (roi[0], roi[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+            cv2.rectangle(annotated_frame, (roi[0], roi[1]), (roi[2], roi[3]), (255, 255, 0), 2)
+        cv2.rectangle(annotated_frame, (refuel_roi[0], refuel_roi[1]), (refuel_roi[2], refuel_roi[3]), (0, 0, 255), 2)
+
+        # Calculate current stopped time for display
+        current_display_stopped_time = total_stopped_time
+        if is_car_stopped:
+            current_display_stopped_time += (frame_count - stop_start_frame) / fps
         
-        cv2.rectangle(annotated_frame, (refuel_roi[0], refuel_roi[1]), (refuel_roi[2], refuel_roi[3]), (0, 0, 255), 2) # Red
-        cv2.putText(annotated_frame, 'Refuel Area', (refuel_roi[0], refuel_roi[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-
-        # Display stats
-        if is_car_stopped and stop_start_time > 0:
-            current_stop_duration = current_time_sec - stop_start_time
-            display_stopped_time = total_stopped_time + current_stop_duration
-        else:
-            display_stopped_time = total_stopped_time
-
-        cv2.putText(annotated_frame, f'Car Stopped Time: {display_stopped_time:.2f}s', (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.putText(annotated_frame, f'Tire Change Time: {tire_change_time:.2f}s', (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-        cv2.putText(annotated_frame, f'Refuel Time: {refuel_time:.2f}s', (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
-
+        cv2.putText(annotated_frame, f'Car Stopped: {current_display_stopped_time:.2f}s', (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(annotated_frame, f'Tire Change: {tire_change_time:.2f}s', (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+        cv2.putText(annotated_frame, f'Refueling: {refuel_time:.2f}s', (20, 120), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
         out.write(annotated_frame)
+
+    # Handle case where car is still stopped when video ends
+    if is_car_stopped:
+        total_stopped_time += (total_frames - stop_start_frame) / fps
 
     cap.release()
     out.release()
     cv2.destroyAllWindows()
-    print(f"Processing complete. Output saved to {output_path}")
+    
+    return total_stopped_time, tire_change_time, refuel_time
 
 def boxes_overlap(box1, box2):
-    # box format: (x_min, y_min, x_max, y_max)
     return not (box1[2] < box2[0] or box1[0] > box2[2] or box1[3] < box2[1] or box1[1] > box2[3])
