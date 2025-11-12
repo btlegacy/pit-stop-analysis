@@ -12,18 +12,6 @@ def get_patch_signature(frame, roi):
         return np.array([0, 0, 0])
     return np.mean(patch, axis=(0, 1))
 
-def get_patch_histogram(frame, roi):
-    """Calculates a color histogram for a region."""
-    h, w = frame.shape[:2]
-    x1, y1, x2, y2 = max(0, int(roi[0])), max(0, int(roi[1])), min(w, int(roi[2])), min(h, int(roi[3]))
-    patch = frame[y1:y2, x1:x2]
-    if patch.size == 0:
-        return None
-    
-    hist = cv2.calcHist([patch], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
-    cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
-    return hist
-
 def boxes_overlap_area(box1, box2):
     """Calculates the area of overlap between two boxes."""
     x1, y1, x2, y2 = max(box1[0], box2[0]), max(box1[1], box2[1]), min(box1[2], box2[2]), min(box1[3], box2[3])
@@ -32,13 +20,17 @@ def boxes_overlap_area(box1, box2):
 def process_video(video_path, output_path, progress_callback):
     model = YOLO('yolov8n.pt')
 
-    baseline_path = 'refs/car.png'
-    if not os.path.exists(baseline_path):
-        print("Error: 'car.png' not found in 'refs' directory.")
+    # --- Load Precise Templates ---
+    probe_in_path = 'refs/probe_in.png'
+    probe_out_path = 'refs/probe_out.png'
+    if not os.path.exists(probe_in_path) or not os.path.exists(probe_out_path):
+        print("Error: Please create 'refs/probe_in.png' and 'refs/probe_out.png' template files.")
         return [0.0] * 3
-    baseline_img = cv2.imread(baseline_path)
-    if baseline_img is None:
-        print("Error: Could not read 'car.png'.")
+    
+    probe_in_template = cv2.imread(probe_in_path, cv2.IMREAD_GRAYSCALE)
+    probe_out_template = cv2.imread(probe_out_path, cv2.IMREAD_GRAYSCALE)
+    if probe_in_template is None or probe_out_template is None:
+        print("Error: Could not read probe template images.")
         return [0.0] * 3
 
     # --- ROIs ---
@@ -46,13 +38,7 @@ def process_video(video_path, output_path, progress_callback):
     tire_rois = [(1210, 30, 1370, 150), (1210, 400, 1400, 550), (685, 10, 830, 100), (685, 430, 780, 500)]
     refuel_roi_in_air = (803, 328, 920, 460)
     refuel_roi_on_ground = (refuel_roi_in_air[0], refuel_roi_in_air[1] + 20, refuel_roi_in_air[2], refuel_roi_in_air[3] + 20)
-
-    # --- Calculate Baseline HISTOGRAMS from car.png ---
-    baseline_hist_refuel_air = get_patch_histogram(baseline_img, refuel_roi_in_air)
-    M = np.float32([[1, 0, 0], [0, 1, 20]])
-    shifted_baseline = cv2.warpAffine(baseline_img, M, (baseline_img.shape[1], baseline_img.shape[0]))
-    baseline_hist_refuel_ground = get_patch_histogram(shifted_baseline, refuel_roi_on_ground)
-
+    
     cap = cv2.VideoCapture(video_path)
     width, height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps, total_frames = cap.get(cv2.CAP_PROP_FPS), int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -65,8 +51,9 @@ def process_video(video_path, output_path, progress_callback):
     stopped_frames_count, is_car_stopped, stop_start_frame = 0, False, 0
     is_car_on_ground = False
     
-    REFUEL_START_CORREL_THRESH = 0.7
-    REFUEL_STOP_CORREL_THRESH = 0.85
+    # Hysteresis based on the *difference* in match scores
+    SCORE_DIFF_START_THRESH = 0.1  # Start if probe_in score is at least 10% higher
+    SCORE_DIFF_STOP_THRESH = 0.05  # Stop if difference drops below 5%
     
     MIN_TIRE_OVERLAP_AREA = 500
     total_stopped_time, tire_change_time, refuel_time = 0.0, 0.0, 0.0
@@ -84,6 +71,7 @@ def process_video(video_path, output_path, progress_callback):
             unobstructed_signature = get_patch_signature(frame, ref_roi)
 
         current_car_stop_sig = get_patch_signature(frame, ref_roi)
+        # (Car stop/drop logic remains the same)
         is_obstructed = np.linalg.norm(current_car_stop_sig - unobstructed_signature) > CAR_STOP_THRESH
         car_is_moving = True
         if is_obstructed:
@@ -112,17 +100,20 @@ def process_video(video_path, output_path, progress_callback):
             if sum(boxes_overlap_area(p, t) for p in person_bboxes for t in tire_rois) > MIN_TIRE_OVERLAP_AREA:
                 tire_change_time += 1/fps
 
+            # --- Competitive Template Matching for Refueling ---
             current_refuel_roi = refuel_roi_on_ground if is_car_on_ground else refuel_roi_in_air
-            baseline_refuel_hist = baseline_hist_refuel_ground if is_car_on_ground else baseline_hist_refuel_air
-            current_refuel_hist = get_patch_histogram(frame, current_refuel_roi)
+            x, y, w, h = current_refuel_roi
+            search_area = cv2.cvtColor(frame[int(y):int(y+h), int(x):int(x+w)], cv2.COLOR_BGR2GRAY)
+            
+            _, score_in, _, _ = cv2.minMaxLoc(cv2.matchTemplate(search_area, probe_in_template, cv2.TM_CCOEFF_NORMED))
+            _, score_out, _, _ = cv2.minMaxLoc(cv2.matchTemplate(search_area, probe_out_template, cv2.TM_CCOEFF_NORMED))
+            
+            score_diff = score_in - score_out
 
-            if current_refuel_hist is not None:
-                correlation = cv2.compareHist(baseline_refuel_hist, current_refuel_hist, cv2.HISTCMP_CORREL)
-                
-                if not is_refueling_state and correlation < REFUEL_START_CORREL_THRESH:
-                    is_refueling_state = True
-                elif is_refueling_state and correlation > REFUEL_STOP_CORREL_THRESH:
-                    is_refueling_state = False
+            if not is_refueling_state and score_diff > SCORE_DIFF_START_THRESH:
+                is_refueling_state = True
+            elif is_refueling_state and score_diff < SCORE_DIFF_STOP_THRESH:
+                is_refueling_state = False
             
             if is_refueling_state:
                 refuel_time += 1 / fps
