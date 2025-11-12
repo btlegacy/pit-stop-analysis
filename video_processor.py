@@ -93,7 +93,7 @@ def process_video(video_path, output_path, progress_callback):
                 tire_change_time += 1/fps
 
             # --- Adaptive Refueling Logic ---
-            if refuel_tracker is None: # We haven't started tracking yet
+            if refuel_tracker is None: 
                 x, y, w, h = refuel_roi_in_air
                 search_area = cv2.cvtColor(frame[int(y):int(y+h), int(x):int(x+w)], cv2.COLOR_BGR2GRAY)
                 
@@ -103,9 +103,9 @@ def process_video(video_path, output_path, progress_callback):
                 if score_in > score_out and score_in > 0.7:
                     is_refueling_state = True
                     # --- Initialize Tracker ---
-                    print("Probe detected. Initializing tracker.")
+                    print("Probe detected. Initializing MedianFlow tracker.")
                     tracker_roi = (x + max_loc_in[0], y + max_loc_in[1], probe_in_template.shape[1], probe_in_template.shape[0])
-                    refuel_tracker = cv2.TrackerCSRT_create()
+                    refuel_tracker = cv2.legacy.TrackerMedianFlow_create()
                     refuel_tracker.init(frame, tracker_roi)
             else: # Tracker is active
                 success, bbox = refuel_tracker.update(frame)
