@@ -43,7 +43,7 @@ def process_video(video_path, output_path, progress_callback):
     stopped_frames_count, is_car_stopped, stop_start_frame = 0, False, 0
     is_car_on_ground = False
     prev_ref_patch_gray = None
-    CAR_DROP_Y_MOVEMENT_THRESH = 2.0 # Pixels/frame threshold for drop detection
+    CAR_DROP_Y_MOVEMENT_THRESH = 2.0 
 
     # --- Timer & State Variables ---
     total_stopped_time, tire_change_time = 0.0, 0.0
@@ -51,7 +51,11 @@ def process_video(video_path, output_path, progress_callback):
     is_refueling = False
     MIN_MATCH_THRESHOLD = 0.6
     tire_rois = [(1210, 30, 1370, 150), (1210, 400, 1400, 550), (685, 10, 830, 100), (685, 430, 780, 500)]
-    refuel_roi = (803, 328, 920, 460)
+    
+    # --- Define both refueling ROIs ---
+    refuel_roi_in_air = (803, 328, 920, 460)
+    refuel_roi_on_ground = (refuel_roi_in_air[0], refuel_roi_in_air[1] + 20, refuel_roi_in_air[2], refuel_roi_in_air[3] + 20)
+    
     MIN_TIRE_OVERLAP_AREA = 500
 
     for frame_count in range(total_frames):
@@ -91,13 +95,14 @@ def process_video(video_path, output_path, progress_callback):
                 current_ref_patch_gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
                 if prev_ref_patch_gray is not None:
                     flow = cv2.calcOpticalFlowFarneback(prev_ref_patch_gray, current_ref_patch_gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
-                    avg_y_flow = np.mean(flow[..., 1])
-                    if avg_y_flow > CAR_DROP_Y_MOVEMENT_THRESH:
+                    if flow is not None and np.mean(flow[..., 1]) > CAR_DROP_Y_MOVEMENT_THRESH:
                         is_car_on_ground = True
                 prev_ref_patch_gray = current_ref_patch_gray
             
-            # --- Refueling Logic ---
-            x, y, w, h = refuel_roi[0], refuel_roi[1], refuel_roi[2]-refuel_roi[0], refuel_roi[3]-refuel_roi[1]
+            # --- Refueling Logic with Dynamic ROI ---
+            current_refuel_roi = refuel_roi_on_ground if is_car_on_ground else refuel_roi_in_air
+            x, y, w, h = current_refuel_roi[0], current_refuel_roi[1], current_refuel_roi[2]-current_refuel_roi[0], current_refuel_roi[3]-current_refuel_roi[1]
+
             if h > 0 and w > 0:
                 search_area = cv2.cvtColor(frame[y:y+h, x:x+w], cv2.COLOR_BGR2GRAY)
                 _, active_score, _, _ = cv2.minMaxLoc(cv2.matchTemplate(search_area, active_template, cv2.TM_CCOEFF_NORMED))
@@ -116,6 +121,9 @@ def process_video(video_path, output_path, progress_callback):
                 tire_change_time += 1/fps
 
         # Drawing logic...
+        cv2.rectangle(annotated_frame, ref_roi_in_air, (0, 0, 255), 2)
+        cv2.rectangle(annotated_frame, refuel_roi_on_ground, (0, 165, 255), 2) # Orange for on-ground
+        
         total_refuel_time = refuel_time_in_air + refuel_time_on_ground
         rect_x, rect_y, rect_w, rect_h = 20, height // 2 - 80, 550, 180
         overlay = annotated_frame.copy()
