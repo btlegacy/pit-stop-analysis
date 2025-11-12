@@ -30,14 +30,15 @@ def process_video(video_path, output_path):
     tire_change_time = 0
     refuel_time = 0
 
-    # For simplicity, we'll define static regions of interest (ROIs) for tire changing and refueling
-    # These would need to be adjusted for your specific video's camera angle
+    # Regions of Interest (ROIs) based on user-provided coordinates
     # Format: (x_min, y_min, x_max, y_max)
     tire_rois = [
-        (int(width * 0.2), int(height * 0.4), int(width * 0.4), int(height * 0.6)),  # Front-left
-        (int(width * 0.6), int(height * 0.4), int(width * 0.8), int(height * 0.6)),  # Front-right
+        (1210, 30, 1370, 150),   # Left Front Tire
+        (1210, 400, 1400, 550),  # Right Front Tire
+        (685, 10, 830, 100),    # Left Rear Tire
+        (685, 430, 780, 500)     # Right Rear Tire
     ]
-    refuel_roi = (int(width * 0.6), int(height * 0.2), int(width * 0.8), int(height * 0.4)) # Side of the car
+    refuel_roi = (803, 328, 920, 460) # Fuel Area
 
     frame_count = 0
 
@@ -105,11 +106,11 @@ def process_video(video_path, output_path):
 
         # --- Draw ROIs and Stats ---
         for roi in tire_rois:
-            cv2.rectangle(annotated_frame, (roi[0], roi[1]), (roi[2], roi[3]), (255, 255, 0), 2)
+            cv2.rectangle(annotated_frame, (roi[0], roi[1]), (roi[2], roi[3]), (255, 255, 0), 2) # Turquoise
             cv2.putText(annotated_frame, 'Tire Area', (roi[0], roi[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
         
-        cv2.rectangle(annotated_frame, (refuel_roi[0], refuel_roi[1]), (refuel_roi[2], refuel_roi[3]), (0, 255, 255), 2)
-        cv2.putText(annotated_frame, 'Refuel Area', (refuel_roi[0], refuel_roi[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+        cv2.rectangle(annotated_frame, (refuel_roi[0], refuel_roi[1]), (refuel_roi[2], refuel_roi[3]), (0, 0, 255), 2) # Red
+        cv2.putText(annotated_frame, 'Refuel Area', (refuel_roi[0], refuel_roi[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
         # Display stats
         if is_car_stopped and stop_start_time > 0:
