@@ -52,7 +52,6 @@ def process_video(video_path, output_path, progress_callback):
     MIN_MATCH_THRESHOLD = 0.6
     tire_rois = [(1210, 30, 1370, 150), (1210, 400, 1400, 550), (685, 10, 830, 100), (685, 430, 780, 500)]
     
-    # --- Define both refueling ROIs ---
     refuel_roi_in_air = (803, 328, 920, 460)
     refuel_roi_on_ground = (refuel_roi_in_air[0], refuel_roi_in_air[1] + 20, refuel_roi_in_air[2], refuel_roi_in_air[3] + 20)
     
@@ -89,7 +88,6 @@ def process_video(video_path, output_path, progress_callback):
             stop_start_frame = 0
 
         if is_car_stopped:
-            # --- Car Drop Detection ---
             if not is_car_on_ground:
                 x1, y1, x2, y2 = ref_roi
                 current_ref_patch_gray = cv2.cvtColor(frame[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
@@ -99,7 +97,6 @@ def process_video(video_path, output_path, progress_callback):
                         is_car_on_ground = True
                 prev_ref_patch_gray = current_ref_patch_gray
             
-            # --- Refueling Logic with Dynamic ROI ---
             current_refuel_roi = refuel_roi_on_ground if is_car_on_ground else refuel_roi_in_air
             x, y, w, h = current_refuel_roi[0], current_refuel_roi[1], current_refuel_roi[2]-current_refuel_roi[0], current_refuel_roi[3]-current_refuel_roi[1]
 
@@ -115,14 +112,15 @@ def process_video(video_path, output_path, progress_callback):
                 else:
                     refuel_time_in_air += 1 / fps
             
-            # Tire change logic
             person_bboxes = [b.xyxy[0].cpu().numpy() for b in results[0].boxes if int(b.cls)==0] if results[0].boxes else []
             if sum(boxes_overlap_area(p, t) for p in person_bboxes for t in tire_rois) > MIN_TIRE_OVERLAP_AREA:
                 tire_change_time += 1/fps
 
-        # Drawing logic...
-        cv2.rectangle(annotated_frame, ref_roi_in_air, (0, 0, 255), 2)
-        cv2.rectangle(annotated_frame, refuel_roi_on_ground, (0, 165, 255), 2) # Orange for on-ground
+        # --- Corrected Drawing Logic ---
+        cv2.rectangle(annotated_frame, (ref_roi[0], ref_roi[1]), (ref_roi[2], ref_roi[3]), (0, 255, 255), 2) # Yellow
+        for roi in tire_rois: cv2.rectangle(annotated_frame, (roi[0], roi[1]), (roi[2], roi[3]), (255, 255, 0), 2) # Turquoise
+        cv2.rectangle(annotated_frame, refuel_roi_in_air, (0, 0, 255), 2) # Red
+        cv2.rectangle(annotated_frame, refuel_roi_on_ground, (0, 165, 255), 2) # Orange
         
         total_refuel_time = refuel_time_in_air + refuel_time_on_ground
         rect_x, rect_y, rect_w, rect_h = 20, height // 2 - 80, 550, 180
