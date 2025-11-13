@@ -49,9 +49,19 @@ def process_video(video_path, output_path, progress_callback):
 
     unobstructed_signature, last_car_stop_sig = None, None
     CAR_STOP_THRESH = 15
-    STOP_CONFIRM_FRAMES = int(fps / 5)
+    STOP_CONFIRM_FRAMES = int(fps / 5)  # keep arrival confirmation as before
     stopped_frames_count, is_car_stopped, stop_start_frame = 0, False, 0
     
+    # --- Early-Movement Detection (to end the stop quickly) ---
+    # Expand the small ref_roi into a larger car area for early movement detection:
+    CAR_MOVE_EXPAND_X = 120
+    CAR_MOVE_EXPAND_Y = 50
+    # Movement thresholds and persistence (tunable)
+    MOVEMENT_MEAN_THRESH = 6.0                 # mean absolute difference (0-255) to consider a frame "moving"
+    MOVING_CONFIRM_FRAMES = max(1, int(fps * 0.08))  # ~2-3 frames at 25-30fps
+    moving_frames_count = 0
+    prev_frame_gray = None
+
     MIN_TIRE_OVERLAP_AREA = 500
     total_stopped_time, tire_change_time, refuel_time = 0.0, 0.0, 0.0
     
@@ -62,8 +72,12 @@ def process_video(video_path, output_path, progress_callback):
 
     for frame_count in range(total_frames):
         ret, frame = cap.read()
-        if not ret: break
+        if not ret:
+            break
         progress_callback(frame_count / total_frames)
+
+        # Precompute grayscale for movement checks
+        curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
         results = model.track(frame, persist=True, classes=[0], verbose=False)
         annotated_frame = results[0].plot()
@@ -72,26 +86,62 @@ def process_video(video_path, output_path, progress_callback):
             unobstructed_signature = get_patch_signature(frame, ref_roi)
 
         current_car_stop_sig = get_patch_signature(frame, ref_roi)
-        # (Car stop logic remains the same)
+        # (Car stop logic remains the same for detecting arrival)
         is_obstructed = np.linalg.norm(current_car_stop_sig - unobstructed_signature) > CAR_STOP_THRESH
         car_is_moving = True
         if is_obstructed:
             if last_car_stop_sig is not None and np.linalg.norm(current_car_stop_sig - last_car_stop_sig) < CAR_STOP_THRESH:
                 stopped_frames_count += 1
-            else: stopped_frames_count = 0
+            else:
+                stopped_frames_count = 0
             if stopped_frames_count > STOP_CONFIRM_FRAMES:
                 car_is_moving = False
-        else: stopped_frames_count = 0
+        else:
+            stopped_frames_count = 0
         last_car_stop_sig = current_car_stop_sig
 
+        # --- Early movement detection to end stop promptly ---
         if not car_is_moving and not is_car_stopped:
+            # just transitioned to stopped state on this frame; initialize movement counters
             is_car_stopped, stop_start_frame = True, frame_count
+            moving_frames_count = 0
         elif car_is_moving and is_car_stopped:
+            # normal case where car starts moving and we were stopped: finalize stop
             is_car_stopped, is_refueling_state, refuel_bbox = False, False, None
             total_stopped_time += (frame_count - stop_start_frame) / fps
             stop_start_frame = 0
+            moving_frames_count = 0
 
+        # If car is stopped, check for early movement in expanded car area
         if is_car_stopped:
+            # compute expanded car movement ROI around ref_roi
+            cx1 = max(0, ref_roi[0] - CAR_MOVE_EXPAND_X)
+            cy1 = max(0, ref_roi[1] - CAR_MOVE_EXPAND_Y)
+            cx2 = min(width, ref_roi[2] + CAR_MOVE_EXPAND_X)
+            cy2 = min(height, ref_roi[3] + CAR_MOVE_EXPAND_Y)
+
+            if prev_frame_gray is not None:
+                prev_patch = prev_frame_gray[cy1:cy2, cx1:cx2]
+                curr_patch = curr_gray[cy1:cy2, cx1:cx2]
+                if prev_patch.size > 0 and curr_patch.size == prev_patch.size:
+                    mean_diff = float(np.mean(cv2.absdiff(prev_patch, curr_patch)))
+                    if mean_diff > MOVEMENT_MEAN_THRESH:
+                        moving_frames_count += 1
+                    else:
+                        moving_frames_count = 0
+
+                    # If movement persists for the short confirmation window, end the stop immediately
+                    if moving_frames_count >= MOVING_CONFIRM_FRAMES:
+                        # finalize stop and reset states
+                        is_car_stopped, is_refueling_state, refuel_bbox = False, False, None
+                        total_stopped_time += (frame_count - stop_start_frame) / fps
+                        stop_start_frame = 0
+                        moving_frames_count = 0
+                else:
+                    # if patches invalid/size mismatch, reset counter
+                    moving_frames_count = 0
+
+            # -- existing tire-change using person boxes --
             person_bboxes = [b.xyxy[0].cpu().numpy() for b in results[0].boxes if int(b.cls)==0] if results[0].boxes else []
             if sum(boxes_overlap_area(p, t) for p in person_bboxes for t in tire_rois) > MIN_TIRE_OVERLAP_AREA:
                 tire_change_time += 1/fps
@@ -123,7 +173,7 @@ def process_video(video_path, output_path, progress_callback):
                     refuel_bbox = None
                 else:
                     search_window = frame[sy1:sy2, sx1:sx2]
-                    # Convert search window to grayscale before matchTemplate (fixes the type error)
+                    # Convert search window to grayscale before matchTemplate
                     search_window_gray = cv2.cvtColor(search_window, cv2.COLOR_BGR2GRAY)
 
                     res = cv2.matchTemplate(search_window_gray, probe_in_template, cv2.TM_CCOEFF_NORMED)
@@ -160,6 +210,9 @@ def process_video(video_path, output_path, progress_callback):
         cv2.putText(annotated_frame, f'Refueling: {refuel_time:.2f}s', (rect_x + 10, rect_y + 120), cv2.FONT_HERSHEY_SIMPLEX, 1, (0,0,0), 2)
         
         out.write(annotated_frame)
+
+        # save current gray frame as previous for next iteration
+        prev_frame_gray = curr_gray.copy()
 
     if is_car_stopped:
         total_stopped_time += (total_frames - stop_start_frame) / fps
