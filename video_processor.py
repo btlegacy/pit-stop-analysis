@@ -57,8 +57,10 @@ def process_video(video_path, output_path, progress_callback):
     CAR_MOVE_EXPAND_X = 120
     CAR_MOVE_EXPAND_Y = 50
     # Movement thresholds and persistence (tunable)
-    MOVEMENT_MEAN_THRESH = 6.0                 # mean absolute difference (0-255) to consider a frame "moving"
-    MOVING_CONFIRM_FRAMES = max(1, int(fps * 0.08))  # ~2-3 frames at 25-30fps
+    MOVEMENT_MEAN_THRESH = 3.0                 # lowered mean absolute difference threshold
+    MOVEMENT_PIXEL_DIFF = 8                    # per-pixel intensity diff threshold
+    MOVEMENT_PCT_THRESH = 0.002                # fraction of pixels changed to consider motion (0.2%)
+    MOVING_CONFIRM_FRAMES = max(1, int(fps * 0.02))  # ~1 frame at 30fps
     moving_frames_count = 0
     prev_frame_gray = None
 
@@ -124,8 +126,16 @@ def process_video(video_path, output_path, progress_callback):
                 prev_patch = prev_frame_gray[cy1:cy2, cx1:cx2]
                 curr_patch = curr_gray[cy1:cy2, cx1:cx2]
                 if prev_patch.size > 0 and curr_patch.size == prev_patch.size:
+                    # mean absolute difference
                     mean_diff = float(np.mean(cv2.absdiff(prev_patch, curr_patch)))
-                    if mean_diff > MOVEMENT_MEAN_THRESH:
+
+                    # pixel-wise motion percentage
+                    diff = cv2.absdiff(prev_patch, curr_patch)
+                    motion_mask = diff > MOVEMENT_PIXEL_DIFF
+                    motion_pct = float(np.count_nonzero(motion_mask)) / (diff.size + 1e-9)
+
+                    # consider this frame "moving" if either metric passes
+                    if mean_diff > MOVEMENT_MEAN_THRESH or motion_pct > MOVEMENT_PCT_THRESH:
                         moving_frames_count += 1
                     else:
                         moving_frames_count = 0
