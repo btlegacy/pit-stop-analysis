@@ -23,15 +23,25 @@ def process_video(video_path, output_path, progress_callback):
     # --- Load Templates for Initial Detection ---
     probe_in_path = 'refs/probe_in.png'
     probe_out_path = 'refs/probe_out.png'
+    mid_line_path = 'refs/midboxline.png'  # new: departure reference
     if not os.path.exists(probe_in_path) or not os.path.exists(probe_out_path):
         print("Error: Please create 'refs/probe_in.png' and 'refs/probe_out.png' template files.")
         return [0.0] * 3
-    
+    # midboxline optional but preferred
+    has_mid_line = os.path.exists(mid_line_path)
+
     probe_in_template = cv2.imread(probe_in_path, cv2.IMREAD_GRAYSCALE)
     probe_out_template = cv2.imread(probe_out_path, cv2.IMREAD_GRAYSCALE)
+    mid_line_template = cv2.imread(mid_line_path, cv2.IMREAD_GRAYSCALE) if has_mid_line else None
+
     if probe_in_template is None or probe_out_template is None:
         print("Error: Could not read probe template images.")
         return [0.0] * 3
+    if has_mid_line and mid_line_template is None:
+        # If file exists but couldn't be read, disable mid-line usage
+        print("Warning: 'midboxline.png' exists but failed to load. Continuing without it.")
+        has_mid_line = False
+        mid_line_template = None
 
     # Template dims (grayscale)
     template_h, template_w = probe_in_template.shape[:2]
@@ -60,6 +70,15 @@ def process_video(video_path, output_path, progress_callback):
     is_refueling_state = False
     TRACK_LOST_THRESHOLD = 0.60 # If match score drops below this, we lose the lock
 
+    # --- Mid-line departure detection params ---
+    # When midboxline.png is present, we match it once on the first frame to find its location,
+    # then while car is stopped we monitor that small patch and stop the timer as soon as the line
+    # appearance changes (indicating the car has crossed that line).
+    LINE_CROSS_THRESH = 25.0       # mean absolute difference threshold to consider the line occluded/changed
+    LINE_CONFIRM_FRAMES = max(1, int(fps * 0.04))  # small confirmation window (~1-2 frames)
+    line_confirm_count = 0
+    mid_line_bbox = None  # (mx, my, mw, mh) where template matched in the frame
+
     for frame_count in range(total_frames):
         ret, frame = cap.read()
         if not ret: break
@@ -68,8 +87,26 @@ def process_video(video_path, output_path, progress_callback):
         results = model.track(frame, persist=True, classes=[0], verbose=False)
         annotated_frame = results[0].plot()
 
+        # On first frame, set unobstructed signature and locate the mid-line template (if available)
         if frame_count == 0:
             unobstructed_signature = get_patch_signature(frame, ref_roi)
+            if has_mid_line and mid_line_template is not None:
+                # ensure template fits
+                th, tw = mid_line_template.shape[:2]
+                if th <= frame.shape[0] and tw <= frame.shape[1]:
+                    try:
+                        # match whole frame (single-shot) to find line location
+                        res_ml = cv2.matchTemplate(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), mid_line_template, cv2.TM_CCOEFF_NORMED)
+                        _, max_val_ml, _, max_loc_ml = cv2.minMaxLoc(res_ml)
+                        mx, my = max_loc_ml
+                        mid_line_bbox = (mx, my, tw, th)
+                        # debug: print("Mid-line located at", mid_line_bbox, "score", max_val_ml)
+                    except Exception:
+                        mid_line_bbox = None
+                else:
+                    # template larger than frame -> disable
+                    mid_line_bbox = None
+                    has_mid_line = False
 
         current_car_stop_sig = get_patch_signature(frame, ref_roi)
         # (Car stop logic remains the same)
@@ -78,37 +115,80 @@ def process_video(video_path, output_path, progress_callback):
         if is_obstructed:
             if last_car_stop_sig is not None and np.linalg.norm(current_car_stop_sig - last_car_stop_sig) < CAR_STOP_THRESH:
                 stopped_frames_count += 1
-            else: stopped_frames_count = 0
+            else:
+                stopped_frames_count = 0
             if stopped_frames_count > STOP_CONFIRM_FRAMES:
                 car_is_moving = False
-        else: stopped_frames_count = 0
+        else:
+            stopped_frames_count = 0
         last_car_stop_sig = current_car_stop_sig
 
+        # Transition detection: start/stop of stopped state
         if not car_is_moving and not is_car_stopped:
+            # just transitioned to stopped
             is_car_stopped, stop_start_frame = True, frame_count
+            # reset line counters
+            line_confirm_count = 0
         elif car_is_moving and is_car_stopped:
+            # car started moving normally (signature-based)
             is_car_stopped, is_refueling_state, refuel_bbox = False, False, None
             total_stopped_time += (frame_count - stop_start_frame) / fps
             stop_start_frame = 0
+            line_confirm_count = 0
 
+        # When stopped, check tire-change and refuel logic as before,
+        # plus mid-line monitoring to stop the timer early if car crosses the mid-line.
         if is_car_stopped:
             person_bboxes = [b.xyxy[0].cpu().numpy() for b in results[0].boxes if int(b.cls)==0] if results[0].boxes else []
             if sum(boxes_overlap_area(p, t) for p in person_bboxes for t in tire_rois) > MIN_TIRE_OVERLAP_AREA:
                 tire_change_time += 1/fps
 
+            # --- Mid-line departure detection ---
+            if has_mid_line and mid_line_bbox is not None:
+                mx, my, mw, mh = mid_line_bbox
+                # extract current patch at the mid-line position
+                # ensure patch is inside frame
+                mx2 = min(width, mx + mw)
+                my2 = min(height, my + mh)
+                if mx < 0 or my < 0 or mx2 <= mx or my2 <= my:
+                    # invalid bbox -> ignore mid-line
+                    pass
+                else:
+                    curr_patch = cv2.cvtColor(frame[my:my2, mx:mx2], cv2.COLOR_BGR2GRAY)
+                    # If sizes mismatch (rare), reset mid_line match and skip
+                    if curr_patch.shape == mid_line_template.shape:
+                        mad = float(np.mean(np.abs(curr_patch.astype(np.float32) - mid_line_template.astype(np.float32))))
+                        # If mean absolute diff exceeds threshold, line appearance changed (likely car crossing)
+                        if mad > LINE_CROSS_THRESH:
+                            line_confirm_count += 1
+                        else:
+                            line_confirm_count = 0
+
+                        if line_confirm_count >= LINE_CONFIRM_FRAMES:
+                            # finalize stop immediately based on mid-line crossing
+                            is_car_stopped, is_refueling_state, refuel_bbox = False, False, None
+                            total_stopped_time += (frame_count - stop_start_frame) / fps
+                            stop_start_frame = 0
+                            line_confirm_count = 0
+                    else:
+                        # sizes mismatch -> ignore
+                        pass
+
             # --- Custom "Track-by-Search" Refueling Logic ---
             if refuel_bbox is None: # We haven't locked on yet
                 x, y, w, h = refuel_roi_in_air
                 # initial detection uses grayscale search area
-                search_area = cv2.cvtColor(frame[int(y):int(y+h), int(x):int(x+w)], cv2.COLOR_BGR2GRAY)
-                
-                _, score_in, _, max_loc_in = cv2.minMaxLoc(cv2.matchTemplate(search_area, probe_in_template, cv2.TM_CCOEFF_NORMED))
-                _, score_out, _, _ = cv2.minMaxLoc(cv2.matchTemplate(search_area, probe_out_template, cv2.TM_CCOEFF_NORMED))
-                
-                if score_in > score_out and score_in > 0.7:
-                    is_refueling_state = True
-                    # Lock On: Store the bounding box of the probe (use template dims)
-                    refuel_bbox = (x + int(max_loc_in[0]), y + int(max_loc_in[1]), template_w, template_h)
+                # ensure roi inside frame
+                sx1, sy1 = max(0, int(x)), max(0, int(y))
+                sx2, sy2 = min(width, int(x+w)), min(height, int(y+h))
+                if sx2 > sx1 and sy2 > sy1:
+                    search_area = cv2.cvtColor(frame[sy1:sy2, sx1:sx2], cv2.COLOR_BGR2GRAY)
+                    _, score_in, _, max_loc_in = cv2.minMaxLoc(cv2.matchTemplate(search_area, probe_in_template, cv2.TM_CCOEFF_NORMED))
+                    _, score_out, _, _ = cv2.minMaxLoc(cv2.matchTemplate(search_area, probe_out_template, cv2.TM_CCOEFF_NORMED))
+                    if score_in > score_out and score_in > 0.7:
+                        is_refueling_state = True
+                        # Lock On: Store the bounding box of the probe (use template dims)
+                        refuel_bbox = (sx1 + int(max_loc_in[0]), sy1 + int(max_loc_in[1]), template_w, template_h)
             else: # We have a lock, now track it by searching in a local window
                 search_pad = 40
                 x, y, w, h = refuel_bbox
@@ -123,7 +203,7 @@ def process_video(video_path, output_path, progress_callback):
                     refuel_bbox = None
                 else:
                     search_window = frame[sy1:sy2, sx1:sx2]
-                    # Convert search window to grayscale before matchTemplate (fixes the type error)
+                    # Convert search window to grayscale before matchTemplate
                     search_window_gray = cv2.cvtColor(search_window, cv2.COLOR_BGR2GRAY)
 
                     res = cv2.matchTemplate(search_window_gray, probe_in_template, cv2.TM_CCOEFF_NORMED)
@@ -148,7 +228,12 @@ def process_video(video_path, output_path, progress_callback):
         cv2.rectangle(annotated_frame, ref_roi, (0, 255, 255), 2)
         for roi in tire_rois: cv2.rectangle(annotated_frame, roi, (255, 255, 0), 2)
         cv2.rectangle(annotated_frame, refuel_roi_in_air, (0, 0, 255), 2)
-        
+
+        # optionally draw mid-line bbox for debugging
+        if mid_line_bbox is not None:
+            mx, my, mw, mh = mid_line_bbox
+            cv2.rectangle(annotated_frame, (mx, my), (mx + mw, my + mh), (0, 165, 255), 1)
+
         rect_x, rect_y, rect_w, rect_h = 20, height // 2 - 60, 450, 130
         overlay = annotated_frame.copy()
         cv2.rectangle(overlay, (rect_x, rect_y), (rect_x + rect_w, rect_y + rect_h), (0, 255, 255), -1)
