@@ -33,6 +33,9 @@ def process_video(video_path, output_path, progress_callback):
         print("Error: Could not read probe template images.")
         return [0.0] * 3
 
+    # Template dims (grayscale)
+    template_h, template_w = probe_in_template.shape[:2]
+
     # --- ROIs and other setup ---
     ref_roi = (1042, 463, 1059, 487)
     tire_rois = [(1210, 30, 1370, 150), (1210, 400, 1400, 550), (685, 10, 830, 100), (685, 430, 780, 500)]
@@ -55,7 +58,7 @@ def process_video(video_path, output_path, progress_callback):
     # --- Custom Tracker State ---
     refuel_bbox = None # Will store (x, y, w, h) of the probe
     is_refueling_state = False
-    TRACK_LOST_THRESHOLD = 0.6 # If match score drops below this, we lose the lock
+    TRACK_LOST_THRESHOLD = 0.60 # If match score drops below this, we lose the lock
 
     for frame_count in range(total_frames):
         ret, frame = cap.read()
@@ -96,6 +99,7 @@ def process_video(video_path, output_path, progress_callback):
             # --- Custom "Track-by-Search" Refueling Logic ---
             if refuel_bbox is None: # We haven't locked on yet
                 x, y, w, h = refuel_roi_in_air
+                # initial detection uses grayscale search area
                 search_area = cv2.cvtColor(frame[int(y):int(y+h), int(x):int(x+w)], cv2.COLOR_BGR2GRAY)
                 
                 _, score_in, _, max_loc_in = cv2.minMaxLoc(cv2.matchTemplate(search_area, probe_in_template, cv2.TM_CCOEFF_NORMED))
@@ -103,30 +107,39 @@ def process_video(video_path, output_path, progress_callback):
                 
                 if score_in > score_out and score_in > 0.7:
                     is_refueling_state = True
-                    # Lock On: Store the bounding box of the probe
-                    ph, pw = probe_in_template.shape
-                    refuel_bbox = (x + max_loc_in[0], y + max_loc_in[1], pw, ph)
-            else: # We have a lock, now track it
-                # Define a search window around the last known position
+                    # Lock On: Store the bounding box of the probe (use template dims)
+                    refuel_bbox = (x + int(max_loc_in[0]), y + int(max_loc_in[1]), template_w, template_h)
+            else: # We have a lock, now track it by searching in a local window
                 search_pad = 40
                 x, y, w, h = refuel_bbox
                 sx1, sy1 = max(0, int(x - search_pad)), max(0, int(y - search_pad))
                 sx2, sy2 = min(width, int(x + w + search_pad)), min(height, int(y + h + search_pad))
-                search_window = frame[sy1:sy2, sx1:sx2]
-                
-                res = cv2.matchTemplate(search_window, probe_in_template, cv2.TM_CCOEFF_NORMED)
-                _, score, _, max_loc = cv2.minMaxLoc(res)
-                
-                if score > TRACK_LOST_THRESHOLD:
-                    is_refueling_state = True
-                    # Update the bounding box to the new location
-                    refuel_bbox = (sx1 + max_loc[0], sy1 + max_loc[1], w, h)
-                    p1 = (int(refuel_bbox[0]), int(refuel_bbox[1]))
-                    p2 = (int(refuel_bbox[0] + refuel_bbox[2]), int(refuel_bbox[1] + refuel_bbox[3]))
-                    cv2.rectangle(annotated_frame, p1, p2, (255, 0, 255), 3, 1) # Draw magenta box
-                else: # We lost the lock
+
+                # If the search window is smaller than the template, we cannot match -> lose the lock
+                win_w = sx2 - sx1
+                win_h = sy2 - sy1
+                if win_w < template_w or win_h < template_h:
                     is_refueling_state = False
                     refuel_bbox = None
+                else:
+                    search_window = frame[sy1:sy2, sx1:sx2]
+                    # Convert search window to grayscale before matchTemplate (fixes the type error)
+                    search_window_gray = cv2.cvtColor(search_window, cv2.COLOR_BGR2GRAY)
+
+                    res = cv2.matchTemplate(search_window_gray, probe_in_template, cv2.TM_CCOEFF_NORMED)
+                    _, score, _, max_loc = cv2.minMaxLoc(res)
+
+                    if score > TRACK_LOST_THRESHOLD:
+                        is_refueling_state = True
+                        # Update the bounding box to the new location (use template dims)
+                        refuel_bbox = (sx1 + int(max_loc[0]), sy1 + int(max_loc[1]), template_w, template_h)
+                        p1 = (int(refuel_bbox[0]), int(refuel_bbox[1]))
+                        p2 = (int(refuel_bbox[0] + refuel_bbox[2]), int(refuel_bbox[1] + refuel_bbox[3]))
+                        cv2.rectangle(annotated_frame, p1, p2, (255, 0, 255), 3, 1) # Draw magenta box
+                    else:
+                        # Lost lock
+                        is_refueling_state = False
+                        refuel_bbox = None
             
             if is_refueling_state:
                 refuel_time += 1 / fps
