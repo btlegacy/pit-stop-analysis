@@ -19,7 +19,6 @@ def boxes_overlap_area(box1, box2):
     return max(0, x2 - x1) * max(0, y2 - y1)
 
 def iou(boxA, boxB):
-    # boxes are (x1,y1,x2,y2) or (x,y,w,h) — we assume xyxy here
     ax1, ay1, ax2, ay2 = boxA
     bx1, by1, bx2, by2 = boxB
     interW = max(0, min(ax2, bx2) - max(ax1, bx1))
@@ -194,25 +193,17 @@ def process_video(video_path, output_path, progress_callback):
     active_template_h = None
 
     # ---------------- Person-tracking state ----------------
-    tracks = {}            # track_id -> track dict
+    tracks = {}
     next_track_id = 1
     IOU_THRESH = 0.35
-    MAX_MISSING_FRAMES = max(2, int(fps * 0.15))  # tolerate short occlusions
-    TRAJ_HISTORY = int(fps * 1.5)  # keep ~1.5s history
-    TIRES_SECONDS_TO_COUNT = 0.5   # sustained presence seconds to count
+    MAX_MISSING_FRAMES = max(2, int(fps * 0.15))
+    TRAJ_HISTORY = int(fps * 1.5)
+    TIRES_SECONDS_TO_COUNT = 0.5
     TIRES_FRAMES_TO_COUNT = max(1, int(fps * TIRES_SECONDS_TO_COUNT))
-
-    # per-track structure:
-    # { 'id', 'bbox'(xyxy), 'last_seen', 'missing', 'history' deque of centers,
-    #   'label', 'label_score', 'tire_frames': dict roi_idx->consecutive frames,
-    #   'tire_cumulative': dict roi_idx->seconds }
-    for roi in tire_rois:
-        pass
 
     # optional: prepare crew matching use
     has_crew = True if crew_templates else False
 
-    # helper to create new track
     def create_track(bbox, frame_idx, crop=None):
         nonlocal next_track_id
         tid = next_track_id
@@ -232,7 +223,6 @@ def process_video(video_path, output_path, progress_callback):
             'last_person_crop': crop
         }
         t['history'].append((cx, cy))
-        # attempt crew label immediately if crop available
         if crop is not None and has_crew:
             lbl, sc = match_crew_by_hist(crop, crew_templates)
             if lbl is not None and sc >= MIN_CREW_MATCH:
@@ -241,7 +231,6 @@ def process_video(video_path, output_path, progress_callback):
         tracks[tid] = t
         return t
 
-    # helper: update a track with matched bbox
     def update_track(t, bbox, frame_idx, crop=None):
         x1,y1,x2,y2 = bbox
         cx, cy = int((x1+x2)/2), int((y1+y2)/2)
@@ -257,7 +246,6 @@ def process_video(video_path, output_path, progress_callback):
                     t['label'] = lbl
                     t['label_score'] = sc
 
-    # main loop
     last_gray = None
     for frame_idx in range(total_frames):
         ret, frame = cap.read()
@@ -267,11 +255,9 @@ def process_video(video_path, output_path, progress_callback):
 
         curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-        # Run YOLO person detection (reuse existing call pattern)
         results = model.track(frame, persist=True, classes=[0], verbose=False)
         annotated_frame = results[0].plot()
 
-        # prepare person detections as xyxy int list and keep crops
         person_dets = []
         person_crops = []
         if results[0].boxes:
@@ -288,7 +274,7 @@ def process_video(video_path, output_path, progress_callback):
                 crop = frame[y1:y2, x1:x2].copy()
                 person_crops.append(crop)
 
-        # Car stopped logic (same as before)
+        # Car stop logic
         if frame_idx == 0:
             unobstructed_signature = get_patch_signature(frame, ref_roi)
 
@@ -308,7 +294,6 @@ def process_video(video_path, output_path, progress_callback):
 
         if not car_is_moving and not is_car_stopped:
             is_car_stopped, stop_start_frame = True, frame_idx
-            # reset track per-stop counters if desired
             for t in tracks.values():
                 for k in t['tire_frames']:
                     t['tire_frames'][k] = 0
@@ -318,18 +303,27 @@ def process_video(video_path, output_path, progress_callback):
             stop_start_frame = 0
 
         # ---------- Person tracking update (IoU matching) ----------
-        # Build IoU matrix between existing tracks and detections
         matched_det_idx = set()
         matched_track_ids = set()
-        if person_dets:
-            track_ids = list(tracks.keys())
+
+        # Prepare track list
+        track_ids = list(tracks.keys())
+
+        # If there are both existing tracks and detections, compute IoU and match; otherwise skip matching
+        if track_ids and person_dets:
             iou_mat = np.zeros((len(track_ids), len(person_dets)), dtype=np.float32)
             for ti, tid in enumerate(track_ids):
                 tb = tracks[tid]['bbox']
                 for di, det in enumerate(person_dets):
                     iou_mat[ti, di] = iou(tb, det)
+
             # Greedy match: pick highest IoU pairs above threshold
+            # Note: guard against empty matrices already ensured above
             while True:
+                # safety: ensure there are elements to argmax
+                if iou_mat.size == 0:
+                    break
+                # find best pair
                 tdi = np.unravel_index(np.argmax(iou_mat), iou_mat.shape)
                 best_val = iou_mat[tdi]
                 if best_val <= IOU_THRESH:
@@ -339,11 +333,11 @@ def process_video(video_path, output_path, progress_callback):
                 if tid in matched_track_ids or di in matched_det_idx:
                     iou_mat[ti, di] = -1.0
                     continue
-                # assign
+                # assign match
                 update_track(tracks[tid], person_dets[di], frame_idx, crop=person_crops[di])
                 matched_track_ids.add(tid)
                 matched_det_idx.add(di)
-                # invalidate row and column
+                # invalidate row and column so they won't be re-used
                 iou_mat[ti, :] = -1.0
                 iou_mat[:, di] = -1.0
 
@@ -352,63 +346,51 @@ def process_video(video_path, output_path, progress_callback):
             if di in matched_det_idx:
                 continue
             crop = person_crops[di]
-            t = create_track(det, frame_idx, crop=crop)
+            create_track(det, frame_idx, crop=crop)
 
-        # increase missing counters for unmatched tracks
+        # increase missing counters for unmatched tracks and prune
         for tid, t in list(tracks.items()):
             if t['last_seen'] != frame_idx:
                 t['missing'] += 1
             else:
                 t['missing'] = 0
             if t['missing'] > MAX_MISSING_FRAMES:
-                # remove track
                 del tracks[tid]
 
         # ---------- If car stopped, evaluate tire activity using tracks ----------
         if is_car_stopped:
-            # legacy person-based ROI check (kept for robustness)
+            # legacy person-based ROI check (kept)
             person_bboxes = person_dets
             if sum(boxes_overlap_area(p, troi) for p in person_bboxes for troi in tire_rois) > 500:
                 tire_change_time += 1.0 / fps
 
-            # use tracks to attribute activity
             if last_gray is not None:
                 for tid, t in tracks.items():
-                    # compute person bbox and crop if present (use last_person_crop)
                     if 'bbox' not in t:
                         continue
                     bx1, by1, bx2, by2 = t['bbox']
-                    # ensure in bounds
                     bx1, by1, bx2, by2 = max(0, bx1), max(0, by1), min(width-1, bx2), min(height-1, by2)
                     if bx2 <= bx1 or by2 <= by1:
                         continue
-                    # person motion within their bbox
                     prev_patch = last_gray[by1:by2, bx1:bx2]
                     curr_patch = curr_gray[by1:by2, bx1:bx2]
                     motion_amt = 0.0
                     if prev_patch.size and curr_patch.size and prev_patch.shape == curr_patch.shape:
                         motion_amt = float(np.mean(cv2.absdiff(prev_patch, curr_patch)))
 
-                    # check each tire ROI for overlap with this track
                     for ridx, troi in enumerate(tire_rois):
                         tx1, ty1, tx2, ty2 = troi
                         overlap_area = boxes_overlap_area((bx1,by1,bx2,by2), troi)
                         if overlap_area > 0:
-                            # increment person presence frames in this ROI
                             t['tire_frames'][ridx] += 1
-                            # if motion exceeds small threshold, consider it active motion
                             MOTION_THRESH = 6.0
                             if motion_amt > MOTION_THRESH:
-                                # count frame as active
                                 t['tire_cumulative'][ridx] += 1.0 / fps
                                 tire_change_time += 1.0 / fps
-                                # annotate ROI as active on frame
                                 cv2.rectangle(annotated_frame, (tx1, ty1), (tx2, ty2), (0,255,0), 2)
-                                # annotate person track
                                 cv2.putText(annotated_frame, f"ID{tid}:{t.get('label','')}", (bx1, by1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0), 2)
                                 cv2.rectangle(annotated_frame, (bx1, by1), (bx2, by2), (0,255,0), 2)
                             else:
-                                # presence but low motion; only mark as active if presence sustained
                                 if t['tire_frames'][ridx] >= TIRES_FRAMES_TO_COUNT:
                                     t['tire_cumulative'][ridx] += 1.0 / fps
                                     tire_change_time += 1.0 / fps
@@ -417,13 +399,8 @@ def process_video(video_path, output_path, progress_callback):
                                     cv2.rectangle(annotated_frame, (bx1, by1), (bx2, by2), (0,255,0), 2)
                                 else:
                                     cv2.rectangle(annotated_frame, (tx1, ty1), (tx2, ty2), (0,255,255), 1)
-                        else:
-                            # no overlap for this ROI; reset that ROI's presence counter if desired
-                            # (we keep cumulative time persistent)
-                            pass
 
-        # ---------- Probe/refuel detection (kept from prior logic) ----------
-        if is_car_stopped:
+            # probe/refuel detection (unchanged)
             if refuel_bbox is None:
                 x, y, w, h = refuel_roi_in_air
                 sx1, sy1 = max(0, int(x)), max(0, int(y))
@@ -437,7 +414,6 @@ def process_video(video_path, output_path, progress_callback):
                     DECISION_THRESH = 0.7
                     if best_in_score > best_out_score and best_in_score >= DECISION_THRESH:
                         active_probe_template = best_in_t
-                        # best_in_idx is max_loc
                         mx, my = best_in_idx
                         active_template_h, active_template_w = active_probe_template.shape[:2]
                         refuel_bbox = (sx1 + int(mx), sy1 + int(my), active_template_w, active_template_h)
@@ -479,14 +455,11 @@ def process_video(video_path, output_path, progress_callback):
         cv2.rectangle(annotated_frame, ref_roi, (0,255,255), 2)
         cv2.rectangle(annotated_frame, refuel_roi_in_air, (0,0,255), 2)
 
-        # draw tire ROIs and per-ROI cumulative times derived from tracks
         overlay_x = 20
         overlay_y = height // 2 - 80
         for ridx, troi in enumerate(tire_rois):
             rx1, ry1, rx2, ry2 = troi
-            # default draw
             cv2.rectangle(annotated_frame, (rx1, ry1), (rx2, ry2), (255,255,0), 1)
-            # compute sum of per-track cumulative times for this ROI for overlay
             total_roi_time = 0.0
             last_label = None
             for t in tracks.values():
@@ -498,7 +471,6 @@ def process_video(video_path, output_path, progress_callback):
                 text = f"{last_label}: {total_roi_time:.2f}s"
             cv2.putText(annotated_frame, text, (overlay_x, overlay_y + ridx*22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
 
-        # status overlay
         rect_x, rect_y, rect_w, rect_h = 20, height // 2 + 20, 520, 120
         overlay = annotated_frame.copy()
         cv2.rectangle(overlay, (rect_x, rect_y), (rect_x + rect_w, rect_y + rect_h), (0,255,255), -1)
@@ -510,10 +482,8 @@ def process_video(video_path, output_path, progress_callback):
 
         out.write(annotated_frame)
 
-        # persist gray frame
         last_gray = curr_gray.copy()
 
-    # finalize
     if is_car_stopped:
         total_stopped_time += (total_frames - stop_start_frame) / fps
 
