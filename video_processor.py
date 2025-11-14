@@ -201,6 +201,22 @@ def process_video(video_path, output_path, progress_callback):
     TIRES_SECONDS_TO_COUNT = 0.5
     TIRES_FRAMES_TO_COUNT = max(1, int(fps * TIRES_SECONDS_TO_COUNT))
 
+    # new latch / release behavior settings
+    TIRE_LATCH_SECONDS = 0.8            # how long to hold after activity drops before releasing
+    TIRE_RELEASE_FRAMES = max(1, int(fps * TIRE_LATCH_SECONDS))
+    MOTION_THRESH = 6.0                 # motion threshold used when attributing active frames
+
+    # initialize per-ROI latch states
+    tire_roi_states = []
+    for roi in tire_rois:
+        tire_roi_states.append({
+            'latched': False,
+            'release_counter': 0,
+            'last_active_frame': -1,
+            'active_track': None,
+            'cumulative_time': 0.0
+        })
+
     # optional: prepare crew matching use
     has_crew = True if crew_templates else False
 
@@ -297,6 +313,9 @@ def process_video(video_path, output_path, progress_callback):
             for t in tracks.values():
                 for k in t['tire_frames']:
                     t['tire_frames'][k] = 0
+            # reset ROI release counters on new stop start
+            for s in tire_roi_states:
+                s['release_counter'] = 0
         elif car_is_moving and is_car_stopped:
             is_car_stopped, is_refueling_state, refuel_bbox = False, False, None
             total_stopped_time += (frame_idx - stop_start_frame) / fps
@@ -318,12 +337,9 @@ def process_video(video_path, output_path, progress_callback):
                     iou_mat[ti, di] = iou(tb, det)
 
             # Greedy match: pick highest IoU pairs above threshold
-            # Note: guard against empty matrices already ensured above
             while True:
-                # safety: ensure there are elements to argmax
                 if iou_mat.size == 0:
                     break
-                # find best pair
                 tdi = np.unravel_index(np.argmax(iou_mat), iou_mat.shape)
                 best_val = iou_mat[tdi]
                 if best_val <= IOU_THRESH:
@@ -333,11 +349,9 @@ def process_video(video_path, output_path, progress_callback):
                 if tid in matched_track_ids or di in matched_det_idx:
                     iou_mat[ti, di] = -1.0
                     continue
-                # assign match
                 update_track(tracks[tid], person_dets[di], frame_idx, crop=person_crops[di])
                 matched_track_ids.add(tid)
                 matched_det_idx.add(di)
-                # invalidate row and column so they won't be re-used
                 iou_mat[ti, :] = -1.0
                 iou_mat[:, di] = -1.0
 
@@ -365,6 +379,7 @@ def process_video(video_path, output_path, progress_callback):
                 tire_change_time += 1.0 / fps
 
             if last_gray is not None:
+                # compute per-track contributions and update per-ROI latch states
                 for tid, t in tracks.items():
                     if 'bbox' not in t:
                         continue
@@ -378,27 +393,54 @@ def process_video(video_path, output_path, progress_callback):
                     if prev_patch.size and curr_patch.size and prev_patch.shape == curr_patch.shape:
                         motion_amt = float(np.mean(cv2.absdiff(prev_patch, curr_patch)))
 
+                    # check each tire ROI for overlap with this track
                     for ridx, troi in enumerate(tire_rois):
                         tx1, ty1, tx2, ty2 = troi
                         overlap_area = boxes_overlap_area((bx1,by1,bx2,by2), troi)
+                        # active_signal indicates this track is currently performing activity at this ROI
+                        active_signal = False
                         if overlap_area > 0:
+                            # presence increases frames counter
                             t['tire_frames'][ridx] += 1
-                            MOTION_THRESH = 6.0
-                            if motion_amt > MOTION_THRESH:
-                                t['tire_cumulative'][ridx] += 1.0 / fps
-                                tire_change_time += 1.0 / fps
-                                cv2.rectangle(annotated_frame, (tx1, ty1), (tx2, ty2), (0,255,0), 2)
-                                cv2.putText(annotated_frame, f"ID{tid}:{t.get('label','')}", (bx1, by1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0), 2)
-                                cv2.rectangle(annotated_frame, (bx1, by1), (bx2, by2), (0,255,0), 2)
-                            else:
-                                if t['tire_frames'][ridx] >= TIRES_FRAMES_TO_COUNT:
-                                    t['tire_cumulative'][ridx] += 1.0 / fps
-                                    tire_change_time += 1.0 / fps
-                                    cv2.rectangle(annotated_frame, (tx1, ty1), (tx2, ty2), (0,255,0), 2)
-                                    cv2.putText(annotated_frame, f"ID{tid}:{t.get('label','')}", (bx1, by1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0), 2)
-                                    cv2.rectangle(annotated_frame, (bx1, by1), (bx2, by2), (0,255,0), 2)
-                                else:
+                            # active if motion above threshold OR sustained presence
+                            if motion_amt > MOTION_THRESH or t['tire_frames'][ridx] >= TIRES_FRAMES_TO_COUNT:
+                                active_signal = True
+
+                        roi_state = tire_roi_states[ridx]
+
+                        if active_signal:
+                            # latch the ROI if any track shows activity
+                            roi_state['latched'] = True
+                            roi_state['release_counter'] = 0
+                            roi_state['last_active_frame'] = frame_idx
+                            roi_state['active_track'] = tid
+                            # count time continuously while latched
+                            roi_state['cumulative_time'] += 1.0 / fps
+                            tire_change_time += 1.0 / fps
+                            # also attribute to the track
+                            t['tire_cumulative'][ridx] += 1.0 / fps
+                            # annotate active
+                            cv2.rectangle(annotated_frame, (tx1, ty1), (tx2, ty2), (0,255,0), 2)
+                            cv2.putText(annotated_frame, f"ID{tid}:{t.get('label','')}", (bx1, by1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0), 2)
+                            cv2.rectangle(annotated_frame, (bx1, by1), (bx2, by2), (0,255,0), 2)
+                        else:
+                            # no immediate activity from this track; if the ROI is currently latched, we increment release counter
+                            if roi_state['latched']:
+                                # If no track currently overlapping, or no motion, start release countdown
+                                roi_state['release_counter'] += 1
+                                if roi_state['release_counter'] >= TIRE_RELEASE_FRAMES:
+                                    # release the latch only after sustained inactivity
+                                    roi_state['latched'] = False
+                                    roi_state['release_counter'] = 0
+                                    roi_state['active_track'] = None
+                                    # continue to show ROI as inactive (faint)
                                     cv2.rectangle(annotated_frame, (tx1, ty1), (tx2, ty2), (0,255,255), 1)
+                                else:
+                                    # keep drawing as active during release window (visual feedback)
+                                    cv2.rectangle(annotated_frame, (tx1, ty1), (tx2, ty2), (0,200,50), 2)
+                            else:
+                                # not latched and no active signal: faint ROI
+                                cv2.rectangle(annotated_frame, (tx1, ty1), (tx2, ty2), (0,255,255), 1)
 
             # probe/refuel detection (unchanged)
             if refuel_bbox is None:
@@ -459,16 +501,18 @@ def process_video(video_path, output_path, progress_callback):
         overlay_y = height // 2 - 80
         for ridx, troi in enumerate(tire_rois):
             rx1, ry1, rx2, ry2 = troi
+            # draw ROI base box
             cv2.rectangle(annotated_frame, (rx1, ry1), (rx2, ry2), (255,255,0), 1)
-            total_roi_time = 0.0
+            # show cumulative time from latched ROI state if available
+            text_time = tire_roi_states[ridx]['cumulative_time']
             last_label = None
+            # get last known label from tracks if any
             for t in tracks.values():
-                total_roi_time += t['tire_cumulative'].get(ridx, 0.0)
                 if t.get('label'):
                     last_label = t.get('label')
-            text = f"R{ridx+1} {total_roi_time:.2f}s"
+            text = f"R{ridx+1} {text_time:.2f}s"
             if last_label:
-                text = f"{last_label}: {total_roi_time:.2f}s"
+                text = f"{last_label}: {text_time:.2f}s"
             cv2.putText(annotated_frame, text, (overlay_x, overlay_y + ridx*22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
 
         rect_x, rect_y, rect_w, rect_h = 20, height // 2 + 20, 520, 120
