@@ -31,9 +31,7 @@ with col1:
     analyze_button = st.button("Analyze Video")
     st.markdown(
         """
-        Tips:
-        - Provide refs/crew templates and refs/annotations.csv to seed crew recognition.
-        - The processor will write an annotated output video and return timings.
+      
         """
     )
 
