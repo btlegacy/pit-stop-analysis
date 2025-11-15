@@ -5,6 +5,10 @@ from ultralytics import YOLO
 import math
 from collections import deque
 
+# Integration: CrewTracker (must be present as crew_tracker.py in repo)
+# The CrewTracker provides per-person tracks with inferred role, hop_time, carrying flag, etc.
+from crew_tracker import CrewTracker
+
 # -------------------- Utilities --------------------
 def get_patch_signature(frame, roi):
     h, w = frame.shape[:2]
@@ -18,56 +22,8 @@ def boxes_overlap_area(box1, box2):
     x1, y1, x2, y2 = max(box1[0], box2[0]), max(box1[1], box2[1]), min(box1[2], box2[2]), min(box1[3], box2[3])
     return max(0, x2 - x1) * max(0, y2 - y1)
 
-def iou(boxA, boxB):
-    ax1, ay1, ax2, ay2 = boxA
-    bx1, by1, bx2, by2 = boxB
-    interW = max(0, min(ax2, bx2) - max(ax1, bx1))
-    interH = max(0, min(ay2, by2) - max(ay1, by1))
-    inter = interW * interH
-    areaA = max(0, ax2 - ax1) * max(0, ay2 - ay1)
-    areaB = max(0, bx2 - bx1) * max(0, by2 - by1)
-    union = (areaA + areaB - inter) if (areaA + areaB - inter) > 0 else 1e-6
-    return inter / union
-
-# ---------------------- Crew template helpers ----------------------
-def load_crew_templates(dir_path):
-    templates = []
-    if not os.path.isdir(dir_path):
-        return templates
-    for fname in sorted(os.listdir(dir_path)):
-        full = os.path.join(dir_path, fname)
-        if not os.path.isfile(full):
-            continue
-        img = cv2.imread(full)
-        if img is None:
-            continue
-        label = os.path.splitext(fname)[0]
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        hist = calc_hsv_hist(img)
-        templates.append({'label': label, 'gray': gray, 'hist': hist})
-    return templates
-
-def calc_hsv_hist(bgr_patch):
-    hsv = cv2.cvtColor(bgr_patch, cv2.COLOR_BGR2HSV)
-    hist = cv2.calcHist([hsv], [0, 1], None, [32, 32], [0, 180, 0, 256])
-    cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
-    return hist
-
-def match_crew_by_hist(bgr_patch, crew_templates):
-    if bgr_patch is None or bgr_patch.size == 0 or not crew_templates:
-        return None, 0.0
-    patch_hist = calc_hsv_hist(bgr_patch)
-    best_score = -1.0
-    best_label = None
-    for ct in crew_templates:
-        score = float(cv2.compareHist(ct['hist'], patch_hist, cv2.HISTCMP_CORREL))
-        if score > best_score:
-            best_score = score
-            best_label = ct['label']
-    return best_label, best_score
-
-# ---------------------- Template helpers ----------------------
 def load_templates_from_dir(dir_path):
+    """Load all grayscale images from a directory into a list of numpy arrays."""
     templates = []
     if not os.path.isdir(dir_path):
         return templates
@@ -82,6 +38,10 @@ def load_templates_from_dir(dir_path):
     return templates
 
 def best_match_template(search_area_gray, templates):
+    """
+    Given a grayscale search area and a list of grayscale templates,
+    return (best_score, best_idx, best_template) or (None, None, None) if no templates.
+    """
     if not templates:
         return None, None, None
     best_score = -1.0
@@ -89,6 +49,7 @@ def best_match_template(search_area_gray, templates):
     best_t = None
     for i, t in enumerate(templates):
         th, tw = t.shape[:2]
+        # If template is larger than search area, skip
         if search_area_gray.shape[0] < th or search_area_gray.shape[1] < tw:
             continue
         res = cv2.matchTemplate(search_area_gray, t, cv2.TM_CCOEFF_NORMED)
@@ -103,22 +64,32 @@ def best_match_template(search_area_gray, templates):
         return None, None, None
     return best_score, best_idx, best_t
 
-# ---------------------- Tire-area helpers ----------------------
 def load_tire_rois_from_image(ref_path, frame_width, frame_height):
+    """
+    Load refs/tirechangeareas.png and detect red-marked boxes.
+    Returns list of ROI tuples (x1,y1,x2,y2) in frame coordinates.
+    """
     if not os.path.exists(ref_path):
         return []
+
     img = cv2.imread(ref_path)
     if img is None:
         return []
+
     ref_h, ref_w = img.shape[:2]
+
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    # red ranges
     lower1 = np.array([0, 100, 100]); upper1 = np.array([10, 255, 255])
     lower2 = np.array([160, 100, 100]); upper2 = np.array([179, 255, 255])
-    mask1 = cv2.inRange(hsv, lower1, upper1); mask2 = cv2.inRange(hsv, lower2, upper2)
+    mask1 = cv2.inRange(hsv, lower1, upper1)
+    mask2 = cv2.inRange(hsv, lower2, upper2)
     mask = cv2.bitwise_or(mask1, mask2)
+
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5,5))
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     rois = []
     for c in contours:
@@ -140,11 +111,11 @@ def load_tire_rois_from_image(ref_path, frame_width, frame_height):
 def process_video(video_path, output_path, progress_callback):
     model = YOLO('yolov8n.pt')
 
-    # --- Crew templates (optional) ---
-    crew_templates = load_crew_templates('refs/crew')
-    MIN_CREW_MATCH = 0.45
+    # Integration: instantiate CrewTracker
+    CREW_WALL_ROI = (0, 200, 360, 720)  # tune for your camera if needed
+    tracker = CrewTracker(device='cpu', crew_dir='refs/crew', crew_wall_roi=CREW_WALL_ROI, embed_device='cpu')
 
-    # --- Probe multi-template support ---
+    # --- Probe multi-template support (unchanged) ---
     probe_in_templates = load_templates_from_dir('refs/probein')
     probe_out_templates = load_templates_from_dir('refs/probeout')
     if not probe_in_templates and os.path.exists('refs/probe_in.png'):
@@ -159,10 +130,11 @@ def process_video(video_path, output_path, progress_callback):
         print("Error: probe-in or probe-out templates missing. Place images in refs/probein and refs/probeout or use fallback files.")
         return [0.0] * 3
 
-    # --- ROIs and other setup (defaults preserved) ---
+    # --- ROIs and other setup ---
     ref_roi = (1042, 463, 1059, 487)
     tire_rois_fallback = [(1210, 30, 1370, 150), (1210, 400, 1400, 550), (685, 10, 830, 100), (685, 430, 780, 500)]
     refuel_roi_in_air = (803, 328, 920, 460)
+    tire_areas_path = 'refs/tirechangeareas.png'
 
     cap = cv2.VideoCapture(video_path)
     width, height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
@@ -171,20 +143,40 @@ def process_video(video_path, output_path, progress_callback):
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
 
-    # Attempt load tire ROIs from user-provided image
-    tire_rois_from_image = load_tire_rois_from_image('refs/tirechangeareas.png', width, height)
-    tire_rois = tire_rois_from_image if tire_rois_from_image else tire_rois_fallback
+    # Attempt load tire ROIs from the tirechangeareas image
+    tire_rois = load_tire_rois_from_image(tire_areas_path, width, height)
+    if not tire_rois:
+        tire_rois = tire_rois_fallback
 
-    # Car stop detection params (kept from earlier)
+    # Car stop detection params
     unobstructed_signature, last_car_stop_sig = None, None
     CAR_STOP_THRESH = 15
     STOP_CONFIRM_FRAMES = int(fps / 5)
     stopped_frames_count, is_car_stopped, stop_start_frame = 0, False, 0
 
+    # Tire latch/release settings
+    TIRE_LATCH_SECONDS = 0.8
+    TIRE_RELEASE_FRAMES = max(1, int(fps * TIRE_LATCH_SECONDS))
+    MOTION_THRESH = 6.0
+    TIRES_SECONDS_TO_COUNT = 0.5
+    TIRES_FRAMES_TO_COUNT = max(1, int(fps * TIRES_SECONDS_TO_COUNT))
+
+    # initialize per-ROI states (latched, release counter, cumulative time, initiator role)
+    tire_roi_states = []
+    for roi in tire_rois:
+        tire_roi_states.append({
+            'latched': False,
+            'release_counter': 0,
+            'last_active_frame': -1,
+            'active_track_id': None,
+            'cumulative_time': 0.0,
+            'initiating_role': None
+        })
+
     # global timers
     total_stopped_time, tire_change_time, refuel_time = 0.0, 0.0, 0.0
 
-    # probe/refuel tracking state
+    # probe/refuel state
     refuel_bbox = None
     is_refueling_state = False
     TRACK_LOST_THRESHOLD = 0.60
@@ -192,77 +184,8 @@ def process_video(video_path, output_path, progress_callback):
     active_template_w = None
     active_template_h = None
 
-    # ---------------- Person-tracking state ----------------
-    tracks = {}
-    next_track_id = 1
-    IOU_THRESH = 0.35
-    MAX_MISSING_FRAMES = max(2, int(fps * 0.15))
-    TRAJ_HISTORY = int(fps * 1.5)
-    TIRES_SECONDS_TO_COUNT = 0.5
-    TIRES_FRAMES_TO_COUNT = max(1, int(fps * TIRES_SECONDS_TO_COUNT))
-
-    # new latch / release behavior settings
-    TIRE_LATCH_SECONDS = 0.8            # how long to hold after activity drops before releasing
-    TIRE_RELEASE_FRAMES = max(1, int(fps * TIRE_LATCH_SECONDS))
-    MOTION_THRESH = 6.0                 # motion threshold used when attributing active frames
-
-    # initialize per-ROI latch states
-    tire_roi_states = []
-    for roi in tire_rois:
-        tire_roi_states.append({
-            'latched': False,
-            'release_counter': 0,
-            'last_active_frame': -1,
-            'active_track': None,
-            'cumulative_time': 0.0
-        })
-
-    # optional: prepare crew matching use
-    has_crew = True if crew_templates else False
-
-    def create_track(bbox, frame_idx, crop=None):
-        nonlocal next_track_id
-        tid = next_track_id
-        next_track_id += 1
-        x1,y1,x2,y2 = bbox
-        cx, cy = int((x1+x2)/2), int((y1+y2)/2)
-        t = {
-            'id': tid,
-            'bbox': bbox,
-            'last_seen': frame_idx,
-            'missing': 0,
-            'history': deque(maxlen=TRAJ_HISTORY),
-            'label': None,
-            'label_score': 0.0,
-            'tire_frames': {i:0 for i in range(len(tire_rois))},
-            'tire_cumulative': {i:0.0 for i in range(len(tire_rois))},
-            'last_person_crop': crop
-        }
-        t['history'].append((cx, cy))
-        if crop is not None and has_crew:
-            lbl, sc = match_crew_by_hist(crop, crew_templates)
-            if lbl is not None and sc >= MIN_CREW_MATCH:
-                t['label'] = lbl
-                t['label_score'] = sc
-        tracks[tid] = t
-        return t
-
-    def update_track(t, bbox, frame_idx, crop=None):
-        x1,y1,x2,y2 = bbox
-        cx, cy = int((x1+x2)/2), int((y1+y2)/2)
-        t['bbox'] = bbox
-        t['last_seen'] = frame_idx
-        t['missing'] = 0
-        t['history'].append((cx, cy))
-        if crop is not None:
-            t['last_person_crop'] = crop
-            if has_crew:
-                lbl, sc = match_crew_by_hist(crop, crew_templates)
-                if lbl is not None and sc >= MIN_CREW_MATCH and sc > t.get('label_score', 0.0):
-                    t['label'] = lbl
-                    t['label_score'] = sc
-
     last_gray = None
+
     for frame_idx in range(total_frames):
         ret, frame = cap.read()
         if not ret:
@@ -271,9 +194,11 @@ def process_video(video_path, output_path, progress_callback):
 
         curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
+        # YOLO person detection
         results = model.track(frame, persist=True, classes=[0], verbose=False)
         annotated_frame = results[0].plot()
 
+        # build person detection boxes and crops
         person_dets = []
         person_crops = []
         if results[0].boxes:
@@ -287,10 +212,9 @@ def process_video(video_path, output_path, progress_callback):
                 if x2 <= x1 or y2 <= y1:
                     continue
                 person_dets.append((x1,y1,x2,y2))
-                crop = frame[y1:y2, x1:x2].copy()
-                person_crops.append(crop)
+                person_crops.append(frame[y1:y2, x1:x2].copy())
 
-        # Car stop logic
+        # Car stop detection (same approach)
         if frame_idx == 0:
             unobstructed_signature = get_patch_signature(frame, ref_roi)
 
@@ -310,10 +234,7 @@ def process_video(video_path, output_path, progress_callback):
 
         if not car_is_moving and not is_car_stopped:
             is_car_stopped, stop_start_frame = True, frame_idx
-            for t in tracks.values():
-                for k in t['tire_frames']:
-                    t['tire_frames'][k] = 0
-            # reset ROI release counters on new stop start
+            # reset per-track tire counters in tracker (if needed) and per-ROI release counters
             for s in tire_roi_states:
                 s['release_counter'] = 0
         elif car_is_moving and is_car_stopped:
@@ -321,66 +242,19 @@ def process_video(video_path, output_path, progress_callback):
             total_stopped_time += (frame_idx - stop_start_frame) / fps
             stop_start_frame = 0
 
-        # ---------- Person tracking update (IoU matching) ----------
-        matched_det_idx = set()
-        matched_track_ids = set()
+        # Update crew tracker with detections (integration point)
+        # tracker.update will populate tracker.tracks with per-person role/hop/carry info
+        tracker.update(person_dets, person_crops, frame, frame_idx, stop_start_frame if is_car_stopped else None)
 
-        # Prepare track list
-        track_ids = list(tracks.keys())
-
-        # If there are both existing tracks and detections, compute IoU and match; otherwise skip matching
-        if track_ids and person_dets:
-            iou_mat = np.zeros((len(track_ids), len(person_dets)), dtype=np.float32)
-            for ti, tid in enumerate(track_ids):
-                tb = tracks[tid]['bbox']
-                for di, det in enumerate(person_dets):
-                    iou_mat[ti, di] = iou(tb, det)
-
-            # Greedy match: pick highest IoU pairs above threshold
-            while True:
-                if iou_mat.size == 0:
-                    break
-                tdi = np.unravel_index(np.argmax(iou_mat), iou_mat.shape)
-                best_val = iou_mat[tdi]
-                if best_val <= IOU_THRESH:
-                    break
-                ti, di = tdi
-                tid = track_ids[ti]
-                if tid in matched_track_ids or di in matched_det_idx:
-                    iou_mat[ti, di] = -1.0
-                    continue
-                update_track(tracks[tid], person_dets[di], frame_idx, crop=person_crops[di])
-                matched_track_ids.add(tid)
-                matched_det_idx.add(di)
-                iou_mat[ti, :] = -1.0
-                iou_mat[:, di] = -1.0
-
-        # create tracks for unmatched detections
-        for di, det in enumerate(person_dets):
-            if di in matched_det_idx:
-                continue
-            crop = person_crops[di]
-            create_track(det, frame_idx, crop=crop)
-
-        # increase missing counters for unmatched tracks and prune
-        for tid, t in list(tracks.items()):
-            if t['last_seen'] != frame_idx:
-                t['missing'] += 1
-            else:
-                t['missing'] = 0
-            if t['missing'] > MAX_MISSING_FRAMES:
-                del tracks[tid]
-
-        # ---------- If car stopped, evaluate tire activity using tracks ----------
+        # ---------- If car stopped, evaluate tire activity using tracker.tracks ----------
         if is_car_stopped:
-            # legacy person-based ROI check (kept)
-            person_bboxes = person_dets
-            if sum(boxes_overlap_area(p, troi) for p in person_bboxes for troi in tire_rois) > 500:
+            # legacy person-ROI fallback counting (keeps previous behavior)
+            if sum(boxes_overlap_area(p, troi) for p in person_dets for troi in tire_rois) > 500:
                 tire_change_time += 1.0 / fps
 
             if last_gray is not None:
-                # compute per-track contributions and update per-ROI latch states
-                for tid, t in tracks.items():
+                # Use tracker-provided tracks to attribute activity
+                for tid, t in tracker.tracks.items():
                     if 'bbox' not in t:
                         continue
                     bx1, by1, bx2, by2 = t['bbox']
@@ -393,53 +267,61 @@ def process_video(video_path, output_path, progress_callback):
                     if prev_patch.size and curr_patch.size and prev_patch.shape == curr_patch.shape:
                         motion_amt = float(np.mean(cv2.absdiff(prev_patch, curr_patch)))
 
+                    # detect hop event for display (tracker sets hopped/hop_time)
+                    # role + hop_time available via t['role'] and t.get('hop_time')
+
                     # check each tire ROI for overlap with this track
                     for ridx, troi in enumerate(tire_rois):
                         tx1, ty1, tx2, ty2 = troi
                         overlap_area = boxes_overlap_area((bx1,by1,bx2,by2), troi)
-                        # active_signal indicates this track is currently performing activity at this ROI
                         active_signal = False
                         if overlap_area > 0:
-                            # presence increases frames counter
-                            t['tire_frames'][ridx] += 1
-                            # active if motion above threshold OR sustained presence
-                            if motion_amt > MOTION_THRESH or t['tire_frames'][ridx] >= TIRES_FRAMES_TO_COUNT:
+                            # presence increases a per-track counter in the tracker (if desired) -- we use simple threshold here
+                            # treat as active if motion OR sustained presence inside ROI
+                            # tracker keeps t['tire_frames'] potentially, but to be robust we re-check simple motion & presence
+                            if motion_amt > MOTION_THRESH:
+                                active_signal = True
+                            # or if they have been in this roi for multiple frames (tracker may have tire_frames stored)
+                            if t.get('tire_frames', {}).get(ridx, 0) >= TIRES_FRAMES_TO_COUNT:
                                 active_signal = True
 
                         roi_state = tire_roi_states[ridx]
 
                         if active_signal:
-                            # latch the ROI if any track shows activity
+                            # latch the ROI if any tracked person shows activity
                             roi_state['latched'] = True
                             roi_state['release_counter'] = 0
                             roi_state['last_active_frame'] = frame_idx
-                            roi_state['active_track'] = tid
+                            roi_state['active_track_id'] = tid
+                            # set initiating role if not set
+                            if roi_state.get('initiating_role') is None and t.get('role'):
+                                roi_state['initiating_role'] = t.get('role')
                             # count time continuously while latched
                             roi_state['cumulative_time'] += 1.0 / fps
                             tire_change_time += 1.0 / fps
-                            # also attribute to the track
-                            t['tire_cumulative'][ridx] += 1.0 / fps
+                            # attribute to the track if tracker supports it
+                            if 'tire_cumulative' in t:
+                                t['tire_cumulative'][ridx] = t.get('tire_cumulative', {}).get(ridx, 0.0) + 1.0 / fps
                             # annotate active
+                            display_label = t.get('role') or t.get('label') or f"ID{tid}"
                             cv2.rectangle(annotated_frame, (tx1, ty1), (tx2, ty2), (0,255,0), 2)
-                            cv2.putText(annotated_frame, f"ID{tid}:{t.get('label','')}", (bx1, by1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0), 2)
+                            cv2.putText(annotated_frame, f"{display_label}", (bx1, by1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0), 2)
                             cv2.rectangle(annotated_frame, (bx1, by1), (bx2, by2), (0,255,0), 2)
                         else:
-                            # no immediate activity from this track; if the ROI is currently latched, we increment release counter
+                            # no immediate activity from this track; if ROI latched, increment release counter
                             if roi_state['latched']:
-                                # If no track currently overlapping, or no motion, start release countdown
                                 roi_state['release_counter'] += 1
                                 if roi_state['release_counter'] >= TIRE_RELEASE_FRAMES:
-                                    # release the latch only after sustained inactivity
+                                    # release latch after sustained inactivity
                                     roi_state['latched'] = False
                                     roi_state['release_counter'] = 0
-                                    roi_state['active_track'] = None
-                                    # continue to show ROI as inactive (faint)
+                                    roi_state['active_track_id'] = None
+                                    # keep initiating_role for statistics (do not clear)
                                     cv2.rectangle(annotated_frame, (tx1, ty1), (tx2, ty2), (0,255,255), 1)
                                 else:
-                                    # keep drawing as active during release window (visual feedback)
+                                    # visual feedback while in release window
                                     cv2.rectangle(annotated_frame, (tx1, ty1), (tx2, ty2), (0,200,50), 2)
                             else:
-                                # not latched and no active signal: faint ROI
                                 cv2.rectangle(annotated_frame, (tx1, ty1), (tx2, ty2), (0,255,255), 1)
 
             # probe/refuel detection (unchanged)
@@ -497,24 +379,38 @@ def process_video(video_path, output_path, progress_callback):
         cv2.rectangle(annotated_frame, ref_roi, (0,255,255), 2)
         cv2.rectangle(annotated_frame, refuel_roi_in_air, (0,0,255), 2)
 
+        # Draw tracks with role & hop info (from tracker)
+        for tid, t in tracker.tracks.items():
+            if 'bbox' not in t:
+                continue
+            bx1,by1,bx2,by2 = t['bbox']
+            label = t.get('role') or t.get('label') or f"ID{tid}"
+            info = f"{label}"
+            if t.get('hopped'):
+                # hop_time should be in seconds if tracker provided it that way; otherwise it may be frame count
+                hop_time = t.get('hop_time')
+                try:
+                    hop_display = f" hop:{hop_time:.2f}s" if hop_time is not None else ""
+                except Exception:
+                    hop_display = f" hop:{hop_time}"
+                info += hop_display
+            cv2.putText(annotated_frame, info, (bx1, by1-18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1)
+            cv2.rectangle(annotated_frame, (bx1,by1), (bx2,by2), (200,200,200), 1)
+
+        # Per-ROI overlays & cumulative times
         overlay_x = 20
         overlay_y = height // 2 - 80
         for ridx, troi in enumerate(tire_rois):
             rx1, ry1, rx2, ry2 = troi
-            # draw ROI base box
             cv2.rectangle(annotated_frame, (rx1, ry1), (rx2, ry2), (255,255,0), 1)
-            # show cumulative time from latched ROI state if available
             text_time = tire_roi_states[ridx]['cumulative_time']
-            last_label = None
-            # get last known label from tracks if any
-            for t in tracks.values():
-                if t.get('label'):
-                    last_label = t.get('label')
+            initiator = tire_roi_states[ridx].get('initiating_role')
             text = f"R{ridx+1} {text_time:.2f}s"
-            if last_label:
-                text = f"{last_label}: {text_time:.2f}s"
+            if initiator:
+                text = f"{initiator}: {text_time:.2f}s"
             cv2.putText(annotated_frame, text, (overlay_x, overlay_y + ridx*22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
 
+        # status overlay
         rect_x, rect_y, rect_w, rect_h = 20, height // 2 + 20, 520, 120
         overlay = annotated_frame.copy()
         cv2.rectangle(overlay, (rect_x, rect_y), (rect_x + rect_w, rect_y + rect_h), (0,255,255), -1)
@@ -528,9 +424,11 @@ def process_video(video_path, output_path, progress_callback):
 
         last_gray = curr_gray.copy()
 
+    # finalize
     if is_car_stopped:
         total_stopped_time += (total_frames - stop_start_frame) / fps
 
     cap.release()
     out.release()
+
     return total_stopped_time, tire_change_time, refuel_time
