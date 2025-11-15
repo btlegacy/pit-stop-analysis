@@ -101,9 +101,7 @@ def process_video(video_path, output_path, progress_callback):
     tracker = CrewTracker(device='cpu', crew_dir='refs/crew', crew_wall_roi=CREW_WALL_ROI, embed_device='cpu')
 
     # Apply tuned tracker settings based on observed frames
-    # (these override defaults in crew_tracker to better handle sprint pit movements)
     tracker.iou_thresh = 0.25
-    # MAX_MISSING will be set after fps is known below
 
     # --- Probe multi-template support ---
     probe_in_templates = load_templates_from_dir('refs/probein')
@@ -118,7 +116,7 @@ def process_video(video_path, output_path, progress_callback):
             probe_out_templates = [t]
     if not probe_in_templates or not probe_out_templates:
         print("Error: probe-in or probe-out templates missing. Place images in refs/probein and refs/probeout or use fallback files.")
-        return [0.0] * 3
+        return [0.0] * 5
 
     # --- ROIs and other setup ---
     ref_roi = (1042, 463, 1059, 487)
@@ -185,7 +183,12 @@ def process_video(video_path, output_path, progress_callback):
     }
 
     # global timers
-    total_stopped_time, tire_change_time, refuel_time = 0.0, 0.0, 0.0
+    total_stopped_time = 0.0
+    tire_change_time = 0.0
+    refuel_time = 0.0
+    # new per-role timers
+    front_tire_time = 0.0
+    rear_tire_time = 0.0
 
     # probe/refuel state
     refuel_bbox = None
@@ -414,13 +417,29 @@ def process_video(video_path, output_path, progress_callback):
                             roi_state['release_counter'] = 0
                             roi_state['last_active_frame'] = frame_idx
                             roi_state['active_track_id'] = tid
+                            # prefer the tracked role
+                            role = t.get('role') or roi_state.get('initiating_role')
                             if roi_state.get('initiating_role') is None and t.get('role'):
                                 roi_state['initiating_role'] = t.get('role')
+                            # count time continuously while latched
                             roi_state['cumulative_time'] += 1.0 / fps
                             tire_change_time += 1.0 / fps
+                            # attribute to the role-based accumulators
+                            if role == 'front_tire_changer':
+                                front_tire_time += 1.0 / fps
+                            elif role == 'rear_tire_changer':
+                                rear_tire_time += 1.0 / fps
+                            else:
+                                # if role is unknown, try to infer from initiator role stored on ROI
+                                init_role = roi_state.get('initiating_role')
+                                if init_role == 'front_tire_changer':
+                                    front_tire_time += 1.0 / fps
+                                elif init_role == 'rear_tire_changer':
+                                    rear_tire_time += 1.0 / fps
+                            # also attribute to the track if supported
                             if 'tire_cumulative' in t:
                                 t['tire_cumulative'][ridx] = t.get('tire_cumulative', {}).get(ridx, 0.0) + 1.0 / fps
-                            display_label = t.get('role') or t.get('label') or f"ID{tid}"
+                            display_label = role or t.get('label') or f"ID{tid}"
                             cv2.rectangle(annotated_frame, (tx1, ty1), (tx2, ty2), (0,255,0), 2)
                             cv2.putText(annotated_frame, f"{display_label}", (bx1, by1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0), 2)
                             cv2.rectangle(annotated_frame, (bx1, by1), (bx2, by2), (0,255,0), 2)
@@ -471,15 +490,17 @@ def process_video(video_path, output_path, progress_callback):
                 text = f"{initiator}: {text_time:.2f}s"
             cv2.putText(annotated_frame, text, (overlay_x, overlay_y + ridx*22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
 
-        # status overlay
-        rect_x, rect_y, rect_w, rect_h = 20, height // 2 + 20, 520, 120
+        # status overlay (added front/rear times)
+        rect_x, rect_y, rect_w, rect_h = 20, height // 2 + 20, 620, 160
         overlay = annotated_frame.copy()
         cv2.rectangle(overlay, (rect_x, rect_y), (rect_x + rect_w, rect_y + rect_h), (0,255,255), -1)
         annotated_frame = cv2.addWeighted(overlay, 0.45, annotated_frame, 0.55, 0)
         current_display_stop_time = total_stopped_time + ((frame_idx - stop_start_frame)/fps if is_car_stopped else 0)
         cv2.putText(annotated_frame, f'Car Stopped: {current_display_stop_time:.2f}s', (rect_x + 10, rect_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,0), 2)
         cv2.putText(annotated_frame, f'Tire Change: {tire_change_time:.2f}s', (rect_x + 10, rect_y + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
-        cv2.putText(annotated_frame, f'Refueling: {refuel_time:.2f}s', (rect_x + 10, rect_y + 90), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
+        cv2.putText(annotated_frame, f'Front Tire: {front_tire_time:.2f}s', (rect_x + 10, rect_y + 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 2)
+        cv2.putText(annotated_frame, f'Rear Tire: {rear_tire_time:.2f}s', (rect_x + 10, rect_y + 115), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 2)
+        cv2.putText(annotated_frame, f'Refueling: {refuel_time:.2f}s', (rect_x + 10, rect_y + 140), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
 
         out.write(annotated_frame)
 
@@ -492,4 +513,5 @@ def process_video(video_path, output_path, progress_callback):
     cap.release()
     out.release()
 
-    return total_stopped_time, tire_change_time, refuel_time
+    # return per-role times along with existing totals
+    return total_stopped_time, tire_change_time, refuel_time, front_tire_time, rear_tire_time
