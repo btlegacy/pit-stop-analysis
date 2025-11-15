@@ -1,59 +1,125 @@
 import streamlit as st
-from video_processor import process_video
 import tempfile
 import os
+import io
+import csv
+from video_processor import process_video
 
-def main():
-    st.title("🏎️ Pit Stop Analysis")
+st.set_page_config(page_title="Pit Stop Analyzer", layout="wide")
 
-    st.write("""
-    Upload a video of a pit stop to analyze the total stop time, 
-    tire changing time, and refueling time.
-    """)
+def save_uploaded_file(uploaded_file):
+    tmp_dir = tempfile.mkdtemp()
+    tmp_path = os.path.join(tmp_dir, uploaded_file.name)
+    with open(tmp_path, "wb") as f:
+        f.write(uploaded_file.getbuffer())
+    return tmp_path, tmp_dir
 
-    uploaded_file = st.file_uploader(
-        "Choose a video...", 
-        type=["mp4", "mov", "avi"]
+def make_csv_bytes(results_dict):
+    buf = io.StringIO()
+    writer = csv.writer(buf)
+    writer.writerow(list(results_dict.keys()))
+    writer.writerow([f"{v:.2f}" for v in results_dict.values()])
+    return buf.getvalue().encode('utf-8')
+
+st.title("Pit Stop Analyzer")
+
+uploaded = st.file_uploader("Upload video (mp4/mov)", type=["mp4", "mov", "avi", "mkv"])
+output_name = st.text_input("Output filename (optional)", value="annotated_output.mp4")
+
+col1, col2 = st.columns([1, 3])
+with col1:
+    analyze_button = st.button("Analyze Video")
+    st.markdown(
+        """
+        Tips:
+        - Provide refs/crew templates and refs/annotations.csv to seed crew recognition.
+        - The processor will write an annotated output video and return timings.
+        """
     )
 
-    if uploaded_file is not None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            input_path = os.path.join(temp_dir, uploaded_file.name)
-            output_path = os.path.join(temp_dir, "analyzed_video.mp4")
+with col2:
+    progress_bar = st.progress(0)
+    progress_text = st.empty()
 
-            with open(input_path, "wb") as f:
-                f.write(uploaded_file.getbuffer())
+# progress callback passed into process_video
+def update_progress(fraction):
+    try:
+        percent = int(max(0.0, min(1.0, fraction)) * 100)
+        progress_bar.progress(percent)
+        progress_text.text(f"Processing... {percent}%")
+    except Exception:
+        pass
 
-            st.video(input_path)
+if analyze_button:
+    if uploaded is None:
+        st.warning("Please upload a video first.")
+    else:
+        # Save upload to temp file
+        input_path, tmp_dir = save_uploaded_file(uploaded)
+        output_path = os.path.join(tmp_dir, output_name)
 
-            if st.button("Analyze Video"):
-                progress_bar = st.progress(0, text="Starting analysis...")
+        st.info("Starting analysis — this can take a few minutes depending on video length and model speed.")
+        try:
+            result = process_video(input_path, output_path, update_progress)
+            # ensure progress shows complete
+            progress_bar.progress(100)
+            progress_text.text("Processing complete")
 
-                def update_progress(percentage):
-                    progress_bar.progress(int(percentage * 100), text=f"Processing... {int(percentage * 100)}%")
+            # result may be a tuple of 3 (old) or 5 (new) values
+            total_stopped_time = tire_change_time = refuel_time = 0.0
+            front_tire_time = rear_tire_time = 0.0
 
-                # Expecting three return values now
-                total_stopped_time, tire_change_time, refuel_time = process_video(input_path, output_path, update_progress)
-                
-                progress_bar.progress(100, text="Analysis Complete!")
-                st.success("Analysis Complete!")
+            if isinstance(result, (list, tuple)):
+                if len(result) >= 5:
+                    total_stopped_time, tire_change_time, refuel_time, front_tire_time, rear_tire_time = result[:5]
+                elif len(result) == 3:
+                    total_stopped_time, tire_change_time, refuel_time = result
+                else:
+                    st.error(f"Unexpected result shape from process_video: {result}")
+            else:
+                st.error("process_video did not return expected result tuple.")
 
-                # --- Simplified Metrics Display ---
-                st.subheader("Pit Stop Statistics")
-                col1, col2, col3 = st.columns(3)
-                col1.metric("Total Stop Time", f"{total_stopped_time:.2f}s")
-                col2.metric("Tire Change Time", f"{tire_change_time:.2f}s")
-                col3.metric("Refueling Time", f"{refuel_time:.2f}s")
+            st.success("Analysis Complete!")
 
+            # Display results
+            st.markdown("### Results")
+            st.write(f"Car stopped total time: {total_stopped_time:.2f}s")
+            st.write(f"Total tire change time (all): {tire_change_time:.2f}s")
+            st.write(f"Front tire change time: {front_tire_time:.2f}s")
+            st.write(f"Rear tire change time: {rear_tire_time:.2f}s")
+            st.write(f"Refuel time: {refuel_time:.2f}s")
+
+            # Provide annotated video for playback / download
+            if os.path.exists(output_path):
                 st.video(output_path)
-
-                with open(output_path, "rb") as file:
-                    st.download_button(
-                        label="Download Analyzed Video",
-                        data=file,
-                        file_name="analyzed_video.mp4",
+                with open(output_path, "rb") as f:
+                    btn = st.download_button(
+                        label="Download annotated video",
+                        data=f,
+                        file_name=os.path.basename(output_path),
                         mime="video/mp4"
                     )
 
-if __name__ == '__main__':
-    main()
+            # CSV download of results
+            results_dict = {
+                "total_stopped_time": total_stopped_time,
+                "tire_change_time": tire_change_time,
+                "front_tire_time": front_tire_time,
+                "rear_tire_time": rear_tire_time,
+                "refuel_time": refuel_time,
+            }
+            csv_bytes = make_csv_bytes(results_dict)
+            st.download_button("Download results (CSV)", data=csv_bytes, file_name="pit_stop_results.csv", mime="text/csv")
+
+        except Exception as e:
+            st.error(f"Error during processing: {e}")
+        finally:
+            # cleanup temp files optionally
+            try:
+                if os.path.exists(input_path):
+                    os.remove(input_path)
+                if os.path.exists(output_path):
+                    # keep output if you want; comment out to remove
+                    pass
+            except Exception:
+                pass
