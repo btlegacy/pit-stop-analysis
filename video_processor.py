@@ -5,7 +5,7 @@ from ultralytics import YOLO
 import math
 from collections import deque
 
-# Integration: CrewTracker (must be present as crew_tracker.py in repo)
+# Integration: CrewTracker (muxst be present as crew_tracker.py in repo)
 from crew_tracker import CrewTracker
 
 # Integration: optional annotation helper (for seeding labels like "fueler")
