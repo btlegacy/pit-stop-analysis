@@ -30,7 +30,7 @@ def load_templates(folder_name):
             if img is not None: templates.append(img)
     return templates
 
-# --- PASS 1: Extraction (In vs Out + Person Check) ---
+# --- PASS 1: Extraction ---
 def extract_telemetry(video_path, progress_callback):
     model = load_model()
     cap = cv2.VideoCapture(video_path)
@@ -41,9 +41,9 @@ def extract_telemetry(video_path, progress_callback):
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     
-    # Load Reference Templates
     temps_in = load_templates("probein")
     temps_out = load_templates("probeout")
+    temps_empty = load_templates("emptyfuelport")
     
     telemetry_data = []
     
@@ -87,15 +87,14 @@ def extract_telemetry(video_path, progress_callback):
         act_bl = np.mean(q_mag[mid_h:, :mid_w])
         act_br = np.mean(q_mag[mid_h:, mid_w:])
         
-        # 4. FUEL (Comparative + Person Logic)
+        # 4. Fuel
         score_in = 0.0
         score_out = 0.0
-        fueler_present = 0  # Boolean
+        score_empty = 0.0
+        fueler_present = 0
         fuel_box = None
         
-        # Track Car (2) and People (0)
         results = model.track(frame, persist=True, classes=[0, 2], verbose=False, conf=0.15)
-        
         car_box = None
         people_boxes = []
         
@@ -103,74 +102,50 @@ def extract_telemetry(video_path, progress_callback):
             boxes = results[0].boxes.xywh.cpu().numpy()
             cls = results[0].boxes.cls.cpu().numpy()
             
-            # Find Car
-            car_indices = [i for i, c in enumerate(cls) if int(c) == 2]
-            # Find People
-            ppl_indices = [i for i, c in enumerate(cls) if int(c) == 0]
-            
-            if car_indices:
-                # Get largest car (ignore background cars)
-                best_area = 0
-                for i in car_indices:
-                    if boxes[i][1] < height * 0.9: # Ignore wall
-                        area = boxes[i][2] * boxes[i][3]
-                        if area > best_area:
-                            best_area = area
-                            cx, cy, cw, ch = boxes[i]
-                            car_box = boxes[i]
+            for i, c in enumerate(cls):
+                if int(c) == 2: # Car
+                    if boxes[i][1] < height * 0.9:
+                        car_box = boxes[i] # Take last valid car
+                elif int(c) == 0: # Person
+                    people_boxes.append(boxes[i])
 
-            if ppl_indices:
-                for i in ppl_indices:
-                    people_boxes.append(boxes[i]) # cx, cy, w, h
-
-        # If Car Found, define Fuel Zone
         if car_box is not None:
             cx, cy, cw, ch = car_box
-            
-            # V50: Use Bottom Half of Car as Fuel Zone
-            x1 = int(cx - cw/2)
-            x2 = int(cx + cw/2)
-            y1 = int(cy)
-            y2 = int(cy + ch/2)
+            x1, x2 = int(cx - cw/2), int(cx + cw/2)
+            y1, y2 = int(cy), int(cy + ch/2) # Bottom half
             
             x1, y1 = max(0, x1), max(0, y1)
             x2, y2 = min(width, x2), min(height, y2)
             
             if x2 > x1 and y2 > y1:
-                fuel_box = (x1, y1, x2-x1, y2-y1) # For debug
+                fuel_box = (x1, y1, x2-x1, y2-y1)
                 fuel_zone = gray[y1:y2, x1:x2]
                 
-                # A. CHECK FOR FUELER (Person Overlap)
-                # Check if any person box intersects the fuel zone
-                for p_box in people_boxes:
-                    pcx, pcy, pw, ph = p_box
-                    px1, py1 = int(pcx - pw/2), int(pcy - ph/2)
-                    px2, py2 = int(pcx + pw/2), int(pcy + ph/2)
-                    
-                    # Intersection
+                # Person Overlap
+                for p in people_boxes:
+                    px1, py1 = int(p[0]-p[2]/2), int(p[1]-p[3]/2)
+                    px2, py2 = int(p[0]+p[2]/2), int(p[1]+p[3]/2)
                     ix1 = max(x1, px1); iy1 = max(y1, py1)
                     ix2 = min(x2, px2); iy2 = min(y2, py2)
-                    
                     if ix2 > ix1 and iy2 > iy1:
                         fueler_present = 1
                         break
                 
-                # B. TEMPLATE MATCHING (In vs Out)
-                # Only run if we have templates
-                if temps_in and temps_out:
-                    # Probe IN
+                if temps_in:
                     for t in temps_in:
-                        if fuel_zone.shape[0] >= t.shape[0] and fuel_zone.shape[1] >= t.shape[1]:
+                        if fuel_zone.shape[0]>=t.shape[0] and fuel_zone.shape[1]>=t.shape[1]:
                             res = cv2.matchTemplate(fuel_zone, t, cv2.TM_CCOEFF_NORMED)
-                            _, max_val, _, _ = cv2.minMaxLoc(res)
-                            if max_val > score_in: score_in = max_val
-                            
-                    # Probe OUT
+                            score_in = max(score_in, cv2.minMaxLoc(res)[1])
+                if temps_out:
                     for t in temps_out:
-                        if fuel_zone.shape[0] >= t.shape[0] and fuel_zone.shape[1] >= t.shape[1]:
+                        if fuel_zone.shape[0]>=t.shape[0] and fuel_zone.shape[1]>=t.shape[1]:
                             res = cv2.matchTemplate(fuel_zone, t, cv2.TM_CCOEFF_NORMED)
-                            _, max_val, _, _ = cv2.minMaxLoc(res)
-                            if max_val > score_out: score_out = max_val
+                            score_out = max(score_out, cv2.minMaxLoc(res)[1])
+                if temps_empty:
+                    for t in temps_empty:
+                        if fuel_zone.shape[0]>=t.shape[0] and fuel_zone.shape[1]>=t.shape[1]:
+                            res = cv2.matchTemplate(fuel_zone, t, cv2.TM_CCOEFF_NORMED)
+                            score_empty = max(score_empty, cv2.minMaxLoc(res)[1])
 
         telemetry_data.append({
             "Frame": frame_idx,
@@ -179,6 +154,7 @@ def extract_telemetry(video_path, progress_callback):
             "Zoom_Score": zoom_score,
             "S_In": score_in,
             "S_Out": score_out,
+            "S_Empty": score_empty,
             "Fueler_Present": fueler_present,
             "Fuel_Box": fuel_box,
             "Act_TL": act_tl, "Act_TR": act_tr,
@@ -192,16 +168,23 @@ def extract_telemetry(video_path, progress_callback):
     cap.release()
     return pd.DataFrame(telemetry_data), fps, width, height
 
-# --- PASS 2: Analysis V50 (Reference Integrated) ---
-def analyze_states_v50(df, fps):
+# --- PASS 2: Analysis ---
+def analyze_states_v51(df, fps):
+    # Ensure we don't crash on short videos
+    if df.empty: return (None,None), (None,None), (None,None), {}, df
+
     window = 15
-    cols = ['Flow_X', 'Zoom_Score', 'S_In', 'S_Out', 'Fueler_Present', 
+    cols = ['Flow_X', 'Zoom_Score', 'S_In', 'S_Out', 'S_Empty', 'Fueler_Present', 
             'Act_TL', 'Act_TR', 'Act_BL', 'Act_BR']
+    
     for col in cols:
-        if len(df) > window:
-            df[f'{col}_Sm'] = savgol_filter(df[col], window, 3)
+        if col in df.columns:
+            if len(df) > window:
+                df[f'{col}_Sm'] = savgol_filter(df[col], window, 3)
+            else:
+                df[f'{col}_Sm'] = df[col]
         else:
-            df[f'{col}_Sm'] = df[col]
+            df[f'{col}_Sm'] = 0.0 # Fallback
 
     df['Zoom_Vel'] = np.gradient(df['Zoom_Score_Sm'])
 
@@ -251,6 +234,31 @@ def analyze_states_v50(df, fps):
             else: t_down = t_end
 
     # 3. CORNER TIMING
+    def get_window(sig, start_g, end_g, sens):
+        mask = (df['Time'] >= start_g) & (df['Time'] <= end_g)
+        if not np.any(mask): return start_g, start_g
+        s_win = sig[mask]
+        t_win = df['Time'][mask].values
+        base = np.percentile(s_win, 10)
+        peak = np.max(s_win)
+        if peak < 0.5: return start_g, start_g
+        
+        t_s = base + (peak-base) * sens
+        t_e = base + (peak-base) * 0.20
+        
+        active = np.where(s_win > t_s)[0]
+        if len(active) == 0: return start_g, start_g
+        i_start = active[0]
+        
+        search_s = max(i_start, np.argmax(s_win))
+        i_end = len(s_win)-1
+        buf = int(fps*0.5)
+        for i in range(search_s, len(s_win)-buf):
+            if s_win[i] < t_e and np.mean(s_win[i:i+buf]) < t_e:
+                i_end = i
+                break
+        return t_win[i_start], t_win[i_end]
+
     map_corners = {}
     if arrival_dir > 0: 
         map_corners['Inside Rear'] = 'Act_BL_Sm'; map_corners['Outside Rear'] = 'Act_TL_Sm'
@@ -260,95 +268,62 @@ def analyze_states_v50(df, fps):
         map_corners['Inside Front'] = 'Act_BL_Sm'; map_corners['Outside Front'] = 'Act_TL_Sm'
 
     corner_stats = {}
-    
     if t_up and t_down:
-        t_ae = t_end 
-        df_j = df[(df['Time'] >= t_up) & (df['Time'] <= t_ae)]
-        times_j = df_j['Time'].values
+        t_ae = t_end
         
-        def get_window(sig, start_g, end_g, sens):
-            mask = (times_j >= start_g) & (times_j <= end_g)
-            if not np.any(mask): return start_g, start_g
-            s_win = sig[mask]
-            t_win = times_j[mask]
-            base = np.percentile(s_win, 10)
-            peak = np.max(s_win)
-            if peak < 0.5: return start_g, start_g
-            
-            t_s = base + (peak-base) * sens
-            t_e = base + (peak-base) * 0.20
-            
-            active = np.where(s_win > t_s)[0]
-            if len(active) == 0: return start_g, start_g
-            i_start = active[0]
-            
-            peak_idx = np.argmax(s_win)
-            search_s = max(i_start, peak_idx)
-            i_end = len(s_win)-1
-            buf = int(fps*0.5)
-            for i in range(search_s, len(s_win)-buf):
-                if s_win[i] < t_e and np.mean(s_win[i:i+buf]) < t_e:
-                    i_end = i
-                    break
-            return t_win[i_start], t_win[i_end]
-
-        # A. FRONT
-        sig_of = df_j[map_corners['Outside Front']].values
-        sig_if = df_j[map_corners['Inside Front']].values
-        t_of_start, t_of_end = get_window(sig_of, t_up, t_ae, 0.3)
-        t_if_start, t_if_end = get_window(sig_if, t_of_start+1.5, t_ae, 0.3)
-        corner_stats['Outside Front'] = (t_of_start, t_of_end)
-        corner_stats['Inside Front'] = (t_if_start, t_if_end)
+        # Front
+        of = df[map_corners['Outside Front']].values
+        if_ = df[map_corners['Inside Front']].values
+        ts_of, te_of = get_window(of, t_up, t_ae, 0.3)
+        ts_if, te_if = get_window(if_, ts_of+1.5, t_ae, 0.3)
+        corner_stats['Outside Front'] = (ts_of, te_of)
+        corner_stats['Inside Front'] = (ts_if, te_if)
         
-        # B. REAR
-        sig_ir = df_j[map_corners['Inside Rear']].values
-        sig_or = df_j[map_corners['Outside Rear']].values
+        # Rear
+        ir = df[map_corners['Inside Rear']].values
+        or_ = df[map_corners['Outside Rear']].values
         
-        t_or_start, t_or_end = get_window(sig_or, t_up + 2.5, t_ae, sens=0.55)
-        t_ir_start, t_ir_raw_end = get_window(sig_ir, t_up, t_ae, sens=0.15)
+        # OR (High threshold)
+        ts_or, te_or = get_window(or_, t_up+2.5, t_ae, 0.55)
+        # IR (Low threshold)
+        ts_ir, te_ir_raw = get_window(ir, t_up, t_ae, 0.15)
         
-        if t_or_start > t_up + 3.0:
-            if t_ir_raw_end < t_or_start:
-                t_ir_end = t_ir_raw_end
+        if ts_or > t_up + 3.0:
+            if te_ir_raw < ts_or:
+                te_ir = te_ir_raw
             else:
-                t_ir_end = t_or_start - 1.0
-                if t_ir_end < t_ir_start + 1.5: t_ir_end = t_ir_start + 1.5
-            t_trans_start = t_ir_end
-            t_trans_end = t_or_start
+                te_ir = ts_or - 1.0
+                if te_ir < ts_ir+1.5: te_ir = ts_ir+1.5
+            t_trans_start = te_ir
+            t_trans_end = ts_or
         else:
-            t_ir_end = t_ir_raw_end
-            t_trans_start, t_trans_end = t_ir_end, t_ir_end
+            te_ir = te_ir_raw
+            t_trans_start, t_trans_end = te_ir, te_ir
             
-        corner_stats['Inside Rear'] = (t_ir_start, t_ir_end)
+        corner_stats['Inside Rear'] = (ts_ir, te_ir)
         corner_stats['Rear Transition'] = (t_trans_start, t_trans_end)
-        corner_stats['Outside Rear'] = (t_or_start, t_or_end)
+        corner_stats['Outside Rear'] = (ts_or, te_or)
 
-    # 4. FUEL (Reference Logic Integrated)
+    # 4. FUEL
     t_fuel_start, t_fuel_end = None, None
-    
     if t_start and t_end:
         fuel_w = df[(df['Time'] >= t_start) & (df['Time'] <= t_end)]
         if not fuel_w.empty:
             s_in = fuel_w['S_In_Sm'].values
             s_out = fuel_w['S_Out_Sm'].values
-            person = fuel_w['Fueler_Present_Sm'].values # >0 means yes
+            s_emp = fuel_w['S_Empty_Sm'].values
+            person = fuel_w['Fueler_Present_Sm'].values
             times = fuel_w['Time'].values
             
-            # LOGIC V50:
-            # 1. Person must be present (person > 0.5)
-            # 2. Probe IN score must be high (> 0.6)
-            # 3. Probe IN must be > Probe OUT (Comparison)
-            
-            is_fueling = (person > 0.5) & (s_in > 0.6) & (s_in > s_out)
-            
+            # In > 0.6, In > Out, In > Empty, Person Present
+            is_fueling = (person > 0.5) & (s_in > 0.6) & (s_in > s_out) & (s_in > s_emp)
             indices = np.where(is_fueling)[0]
             
-            if len(indices) > int(fps * 1.5): # Sustained for 1.5s
+            if len(indices) > int(fps * 1.5):
                 t_fuel_start = times[indices[0]]
                 
-                # Find end
                 diffs = np.diff(indices)
-                splits = np.where(diffs > 15)[0]
+                splits = np.where(diffs > 20)[0]
                 end_idx = indices[splits[0]] if len(splits) > 0 else indices[-1]
                 
                 t_fuel_end = times[end_idx]
@@ -357,7 +332,7 @@ def analyze_states_v50(df, fps):
     if t_up is None: t_up = t_start
     if t_down is None: t_down = t_end
 
-    return (t_start, t_end), (t_up, t_down), (t_fuel_start, t_fuel_end), corner_stats
+    return (t_start, t_end), (t_up, t_down), (t_fuel_start, t_fuel_end), corner_stats, df
 
 # --- PASS 3: Render ---
 def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, height, show_debug, progress_callback):
@@ -437,12 +412,12 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
         if show_debug:
             safe_idx = min(frame_idx, len(df)-1)
             row = df.iloc[safe_idx]
-            sc = row['S_In_Sm']
-            ppl = row['Fueler_Present_Sm']
+            sc = row.get('S_In_Sm', 0.0)
+            ppl = row.get('Fueler_Present_Sm', 0.0)
             cv2.putText(frame, f"P:{sc:.2f} H:{ppl:.1f}", (width-430, 330), 0, 0.5, (0, 255, 255), 1)
             
-            fb = row['Fuel_Box']
-            if fb is not None:
+            fb = row.get('Fuel_Box')
+            if fb is not None and not pd.isna(fb):
                 x,y,w,h = fb
                 cv2.rectangle(frame, (x,y), (x+w, y+h), (0,255,255), 2)
 
@@ -456,9 +431,9 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V50")
-    st.markdown("### Reference-Integrated Fuel Logic")
-    st.info("Fueling requires: **Person (Fueler) Present** AND **'Probe In' match > 'Probe Out' match**.")
+    st.title("🏁 Pit Stop Analyzer V51")
+    st.markdown("### Robust Architecture")
+    st.info("Includes Session State safety checks and explicit data flow handling to prevent errors.")
 
     show_debug = st.sidebar.checkbox("Show Debug Info", value=False)
 
@@ -481,20 +456,20 @@ def main():
         
         try:
             bar = st.progress(0)
-            st.write("Step 1: Extraction (Flow, Zoom, Person, Templates)...")
+            st.write("Step 1: Extraction...")
             df, fps, w, h = extract_telemetry(tfile.name, bar.progress)
             
             st.write("Step 2: Analysis...")
-            pit_t, tire_t, fuel_t, corners = analyze_states_v50(df, fps)
+            pit_t, tire_t, fuel_t, corners, df_final = analyze_states_v51(df, fps)
             
             if pit_t[0] is None:
                 st.error("Could not detect Stop.")
             else:
                 st.write("Step 3: Rendering Video...")
-                vid_path = render_overlay(tfile.name, pit_t, tire_t, fuel_t, corners, df, fps, w, h, show_debug, bar.progress)
+                vid_path = render_overlay(tfile.name, pit_t, tire_t, fuel_t, corners, df_final, fps, w, h, show_debug, bar.progress)
                 
                 st.session_state.update({
-                    'df': df, 'video_path': vid_path, 
+                    'df': df_final, 'video_path': vid_path, 
                     'timings': (pit_t, tire_t, fuel_t, corners), 'analysis_done': True
                 })
             bar.empty()
@@ -506,7 +481,14 @@ def main():
     if st.session_state['analysis_done']:
         df = st.session_state['df']
         vid_path = st.session_state['video_path']
-        pit_t, tire_t, fuel_t, corners = st.session_state['timings']
+        timings = st.session_state['timings']
+        
+        # Ensure mappings exist (legacy session check)
+        if len(timings) == 4:
+            pit_t, tire_t, fuel_t, corners = timings
+        else:
+            st.warning("Please re-run analysis to update data format.")
+            st.stop()
         
         st.divider()
         c1, c2, c3 = st.columns(3)
@@ -526,6 +508,15 @@ def main():
         t2.metric("Transition", f"{c_tr[1]-c_tr[0]:.2f}s")
         t3.metric("Outside Rear", f"{c_or[1]-c_or[0]:.2f}s")
         
+        st.subheader("📊 Telemetry")
+        
+        # Check for columns before plotting
+        if 'S_In_Sm' in df.columns and 'Zoom_Score_Sm' in df.columns:
+            base = alt.Chart(df).encode(x='Time')
+            fuel_chart = base.mark_area(color='orange', opacity=0.3).encode(y=alt.Y('S_In_Sm', title='Fuel Score'))
+            zoom_chart = base.mark_line(color='magenta').encode(y=alt.Y('Zoom_Score_Sm', title='Zoom'))
+            st.altair_chart((fuel_chart + zoom_chart).interactive(), use_container_width=True)
+        
         st.subheader("Video Result")
         c1, c2 = st.columns([3,1])
         with c1:
@@ -533,7 +524,7 @@ def main():
         with c2:
             if os.path.exists(vid_path):
                 with open(vid_path, 'rb') as f:
-                    st.download_button("Download MP4", f, file_name="pitstop_v50.mp4")
+                    st.download_button("Download MP4", f, file_name="pitstop_v51.mp4")
 
 if __name__ == "__main__":
     main()
