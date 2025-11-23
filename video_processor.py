@@ -1,517 +1,539 @@
+import streamlit as st
 import cv2
 import numpy as np
+import tempfile
 import os
+import glob
+import pandas as pd
+import altair as alt
+from scipy.signal import savgol_filter, find_peaks
 from ultralytics import YOLO
-import math
-from collections import deque
 
-# Integration: CrewTracker (muxst be present as crew_tracker.py in repo)
-from crew_tracker import CrewTracker
+# --- Configuration ---
+st.set_page_config(page_title="Pit Stop Analytics AI", layout="wide")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-# Integration: optional annotation helper (for seeding labels like "fueler")
-from annotation_helper import load_annotations, apply_annotations_to_tracker
+@st.cache_resource
+def load_model():
+    return YOLO('yolov8n.pt')
 
-# -------------------- Utilities --------------------
-def get_patch_signature(frame, roi):
-    h, w = frame.shape[:2]
-    x1, y1, x2, y2 = max(0, int(roi[0])), max(0, int(roi[1])), min(w, int(roi[2])), min(h, int(roi[3]))
-    patch = frame[y1:y2, x1:x2]
-    if patch.size == 0:
-        return np.array([0, 0, 0])
-    return np.mean(patch, axis=(0, 1))
-
-def boxes_overlap_area(box1, box2):
-    x1, y1, x2, y2 = max(box1[0], box2[0]), max(box1[1], box2[1]), min(box1[2], box2[2]), min(box1[3], box2[3])
-    return max(0, x2 - x1) * max(0, y2 - y1)
-
-def load_templates_from_dir(dir_path):
+def load_templates(folder_name):
     templates = []
-    if not os.path.isdir(dir_path):
-        return templates
-    for fname in sorted(os.listdir(dir_path)):
-        full = os.path.join(dir_path, fname)
-        if not os.path.isfile(full):
-            continue
-        img = cv2.imread(full, cv2.IMREAD_GRAYSCALE)
-        if img is None:
-            continue
-        templates.append(img)
+    path = os.path.join(BASE_DIR, "refs", folder_name, "*")
+    files = glob.glob(path)
+    if not files:
+        path = os.path.join(BASE_DIR, "refs", f"{folder_name}.*")
+        files = glob.glob(path)
+    for f in files:
+        if f.lower().endswith(('.png', '.jpg', '.jpeg')):
+            img = cv2.imread(f, cv2.IMREAD_GRAYSCALE)
+            if img is not None: templates.append(img)
     return templates
 
-def best_match_template(search_area_gray, templates):
-    if not templates:
-        return None, None, None
-    best_score = -1.0
-    best_idx = None
-    best_t = None
-    for i, t in enumerate(templates):
-        th, tw = t.shape[:2]
-        if search_area_gray.shape[0] < th or search_area_gray.shape[1] < tw:
-            continue
-        res = cv2.matchTemplate(search_area_gray, t, cv2.TM_CCOEFF_NORMED)
-        if res is None:
-            continue
-        _, max_val, _, max_loc = cv2.minMaxLoc(res)
-        if max_val > best_score:
-            best_score = float(max_val)
-            best_idx = max_loc
-            best_t = t
-    if best_idx is None:
-        return None, None, None
-    return best_score, best_idx, best_t
-
-def load_tire_rois_from_image(ref_path, frame_width, frame_height):
-    if not os.path.exists(ref_path):
-        return []
-    img = cv2.imread(ref_path)
-    if img is None:
-        return []
-    ref_h, ref_w = img.shape[:2]
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    lower1 = np.array([0, 100, 100]); upper1 = np.array([10, 255, 255])
-    lower2 = np.array([160, 100, 100]); upper2 = np.array([179, 255, 255])
-    mask1 = cv2.inRange(hsv, lower1, upper1); mask2 = cv2.inRange(hsv, lower2, upper2)
-    mask = cv2.bitwise_or(mask1, mask2)
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5,5))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    rois = []
-    for c in contours:
-        x, y, w, h = cv2.boundingRect(c)
-        if w < 8 or h < 8:
-            continue
-        scale_x = frame_width / ref_w
-        scale_y = frame_height / ref_h
-        fx1 = int(x * scale_x); fy1 = int(y * scale_y)
-        fx2 = int((x + w) * scale_x); fy2 = int((y + h) * scale_y)
-        fx1, fy1 = max(0, fx1), max(0, fy1)
-        fx2, fy2 = min(frame_width, fx2), min(frame_height, fy2)
-        if fx2 > fx1 and fy2 > fy1:
-            rois.append((fx1, fy1, fx2, fy2))
-    rois = sorted(rois, key=lambda r: (r[1], r[0]))
-    return rois
-
-# ---------------------- Main processing ----------------------
-def process_video(video_path, output_path, progress_callback):
-    model = YOLO('yolov8n.pt')
-
-    # Integration: instantiate CrewTracker
-    CREW_WALL_ROI = (0, 200, 360, 720)  # tune for your camera if needed
-    tracker = CrewTracker(device='cpu', crew_dir='refs/crew', crew_wall_roi=CREW_WALL_ROI, embed_device='cpu')
-
-    # Apply tuned tracker settings based on observed frames
-    tracker.iou_thresh = 0.25
-
-    # --- Probe multi-template support ---
-    probe_in_templates = load_templates_from_dir('refs/probein')
-    probe_out_templates = load_templates_from_dir('refs/probeout')
-    if not probe_in_templates and os.path.exists('refs/probe_in.png'):
-        t = cv2.imread('refs/probe_in.png', cv2.IMREAD_GRAYSCALE)
-        if t is not None:
-            probe_in_templates = [t]
-    if not probe_out_templates and os.path.exists('refs/probe_out.png'):
-        t = cv2.imread('refs/probe_out.png', cv2.IMREAD_GRAYSCALE)
-        if t is not None:
-            probe_out_templates = [t]
-    if not probe_in_templates or not probe_out_templates:
-        print("Error: probe-in or probe-out templates missing. Place images in refs/probein and refs/probeout or use fallback files.")
-        return [0.0] * 5
-
-    # --- ROIs and other setup ---
-    ref_roi = (1042, 463, 1059, 487)
-    tire_rois_fallback = [(1210, 30, 1370, 150), (1210, 400, 1400, 550), (685, 10, 830, 100), (685, 430, 780, 500)]
-    refuel_roi_in_air = (803, 328, 920, 460)
-    tire_areas_path = 'refs/tirechangeareas.png'
-
-    # Load optional annotations (manual labels) to seed tracker (refs/annotations.csv)
-    annotations = load_annotations('refs/annotations.csv') if os.path.exists('refs/annotations.csv') else {}
-
+# --- PASS 1: Extraction (In vs Out + Person Check) ---
+def extract_telemetry(video_path, progress_callback):
+    model = load_model()
     cap = cv2.VideoCapture(video_path)
-    width, height = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-
-    # now set tracker parameters dependent on fps
-    tracker.max_missing = max(4, int(fps * 0.5))
-    tracker.history_len = int(fps * 2.0)
-
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-
-    # Attempt load tire ROIs from the tirechangeareas image
-    tire_rois = load_tire_rois_from_image(tire_areas_path, width, height)
-    if not tire_rois:
-        tire_rois = tire_rois_fallback
-
-    # Car stop detection params
-    unobstructed_signature, last_car_stop_sig = None, None
-    CAR_STOP_THRESH = 15
-    STOP_CONFIRM_FRAMES = int(fps / 5)
-    stopped_frames_count, is_car_stopped, stop_start_frame = 0, False, 0
-
-    # Tire latch/release settings
-    TIRE_LATCH_SECONDS = 1.2
-    TIRE_RELEASE_FRAMES = max(1, int(fps * TIRE_LATCH_SECONDS))
-    MOTION_THRESH = 4.0
-    TIRES_SECONDS_TO_COUNT = 0.5
-    TIRES_FRAMES_TO_COUNT = max(1, int(fps * TIRES_SECONDS_TO_COUNT))
-
-    # Fueler-specific settings
-    FUELER_RELEASE_SECONDS = 1.5
-    FUELER_RELEASE_FRAMES = max(1, int(fps * FUELER_RELEASE_SECONDS))
-
-    # initialize per-ROI states (latched, release counter, cumulative time, initiator role)
-    tire_roi_states = []
-    for roi in tire_rois:
-        tire_roi_states.append({
-            'latched': False,
-            'release_counter': 0,
-            'last_active_frame': -1,
-            'active_track_id': None,
-            'cumulative_time': 0.0,
-            'initiating_role': None
-        })
-
-    # fueler state
-    fueler_state = {
-        'in_fuel': False,
-        'start_frame': None,
-        'release_counter': 0,
-        'initiating_track': None,
-        'completed_fills': []  # list of (track_id, duration_s)
-    }
-
-    # global timers
-    total_stopped_time = 0.0
-    tire_change_time = 0.0
-    refuel_time = 0.0
-    # new per-role timers
-    front_tire_time = 0.0
-    rear_tire_time = 0.0
-
-    # probe/refuel state
-    refuel_bbox = None
-    is_refueling_state = False
-    TRACK_LOST_THRESHOLD = 0.60
-    active_probe_template = None
-    active_template_w = None
-    active_template_h = None
-
-    last_gray = None
-
-    for frame_idx in range(total_frames):
+    
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps == 0: fps = 30
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # Load Reference Templates
+    temps_in = load_templates("probein")
+    temps_out = load_templates("probeout")
+    
+    telemetry_data = []
+    
+    g_x1, g_x2 = int(width * 0.15), int(width * 0.85)
+    g_y1, g_y2 = int(height * 0.15), int(height * 0.85)
+    mid_x = int((g_x2 - g_x1) / 2)
+    
+    ret, prev_frame = cap.read()
+    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
+    prev_roi = prev_gray[g_y1:g_y2, g_x1:g_x2]
+    
+    frame_idx = 0
+    
+    while cap.isOpened():
         ret, frame = cap.read()
-        if not ret:
-            break
-        progress_callback(frame_idx / total_frames)
+        if not ret: break
+            
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        curr_roi = gray[g_y1:g_y2, g_x1:g_x2]
+        
+        # 1. Optical Flow
+        flow = cv2.calcOpticalFlowFarneback(prev_roi, curr_roi, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+        fx = flow[..., 0]
+        mag = np.sqrt(fx**2 + flow[..., 1]**2)
+        active = mag > 1.0 
+        flow_x = np.median(fx[active]) if np.any(active) else 0.0
+        
+        # 2. Zoom
+        f_left = fx[:, :mid_x]
+        f_right = fx[:, mid_x:]
+        val_l = np.median(f_left[np.abs(f_left)>0.5]) if np.any(np.abs(f_left)>0.5) else 0.0
+        val_r = np.median(f_right[np.abs(f_right)>0.5]) if np.any(np.abs(f_right)>0.5) else 0.0
+        zoom_score = val_r - val_l
+        
+        # 3. 4-Corner
+        h_roi, w_roi = curr_roi.shape
+        mid_h, mid_w = h_roi // 2, w_roi // 2
+        q_mag = mag 
+        act_tl = np.mean(q_mag[:mid_h, :mid_w])
+        act_tr = np.mean(q_mag[:mid_h, mid_w:])
+        act_bl = np.mean(q_mag[mid_h:, :mid_w])
+        act_br = np.mean(q_mag[mid_h:, mid_w:])
+        
+        # 4. FUEL (Comparative + Person Logic)
+        score_in = 0.0
+        score_out = 0.0
+        fueler_present = 0  # Boolean
+        fuel_box = None
+        
+        # Track Car (2) and People (0)
+        results = model.track(frame, persist=True, classes=[0, 2], verbose=False, conf=0.15)
+        
+        car_box = None
+        people_boxes = []
+        
+        if results[0].boxes.id is not None:
+            boxes = results[0].boxes.xywh.cpu().numpy()
+            cls = results[0].boxes.cls.cpu().numpy()
+            
+            # Find Car
+            car_indices = [i for i, c in enumerate(cls) if int(c) == 2]
+            # Find People
+            ppl_indices = [i for i, c in enumerate(cls) if int(c) == 0]
+            
+            if car_indices:
+                # Get largest car (ignore background cars)
+                best_area = 0
+                for i in car_indices:
+                    if boxes[i][1] < height * 0.9: # Ignore wall
+                        area = boxes[i][2] * boxes[i][3]
+                        if area > best_area:
+                            best_area = area
+                            cx, cy, cw, ch = boxes[i]
+                            car_box = boxes[i]
 
-        curr_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if ppl_indices:
+                for i in ppl_indices:
+                    people_boxes.append(boxes[i]) # cx, cy, w, h
 
-        # YOLO person detection
-        results = model.track(frame, persist=True, classes=[0], verbose=False)
-        annotated_frame = results[0].plot()
+        # If Car Found, define Fuel Zone
+        if car_box is not None:
+            cx, cy, cw, ch = car_box
+            
+            # V50: Use Bottom Half of Car as Fuel Zone
+            x1 = int(cx - cw/2)
+            x2 = int(cx + cw/2)
+            y1 = int(cy)
+            y2 = int(cy + ch/2)
+            
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(width, x2), min(height, y2)
+            
+            if x2 > x1 and y2 > y1:
+                fuel_box = (x1, y1, x2-x1, y2-y1) # For debug
+                fuel_zone = gray[y1:y2, x1:x2]
+                
+                # A. CHECK FOR FUELER (Person Overlap)
+                # Check if any person box intersects the fuel zone
+                for p_box in people_boxes:
+                    pcx, pcy, pw, ph = p_box
+                    px1, py1 = int(pcx - pw/2), int(pcy - ph/2)
+                    px2, py2 = int(pcx + pw/2), int(pcy + ph/2)
+                    
+                    # Intersection
+                    ix1 = max(x1, px1); iy1 = max(y1, py1)
+                    ix2 = min(x2, px2); iy2 = min(y2, py2)
+                    
+                    if ix2 > ix1 and iy2 > iy1:
+                        fueler_present = 1
+                        break
+                
+                # B. TEMPLATE MATCHING (In vs Out)
+                # Only run if we have templates
+                if temps_in and temps_out:
+                    # Probe IN
+                    for t in temps_in:
+                        if fuel_zone.shape[0] >= t.shape[0] and fuel_zone.shape[1] >= t.shape[1]:
+                            res = cv2.matchTemplate(fuel_zone, t, cv2.TM_CCOEFF_NORMED)
+                            _, max_val, _, _ = cv2.minMaxLoc(res)
+                            if max_val > score_in: score_in = max_val
+                            
+                    # Probe OUT
+                    for t in temps_out:
+                        if fuel_zone.shape[0] >= t.shape[0] and fuel_zone.shape[1] >= t.shape[1]:
+                            res = cv2.matchTemplate(fuel_zone, t, cv2.TM_CCOEFF_NORMED)
+                            _, max_val, _, _ = cv2.minMaxLoc(res)
+                            if max_val > score_out: score_out = max_val
 
-        # build person detection boxes and crops
-        person_dets = []
-        person_crops = []
-        if results[0].boxes:
-            for b in results[0].boxes:
-                if int(b.cls) != 0:
-                    continue
-                xyxy = b.xyxy[0].cpu().numpy()
-                x1,y1,x2,y2 = [int(v) for v in xyxy]
-                x1,y1 = max(0, x1), max(0, y1)
-                x2,y2 = min(width-1, x2), min(height-1, y2)
-                if x2 <= x1 or y2 <= y1:
-                    continue
-                person_dets.append((x1,y1,x2,y2))
-                person_crops.append(frame[y1:y2, x1:x2].copy())
-
-        # Car stop detection (same approach)
-        if frame_idx == 0:
-            unobstructed_signature = get_patch_signature(frame, ref_roi)
-
-        current_car_stop_sig = get_patch_signature(frame, ref_roi)
-        is_obstructed = np.linalg.norm(current_car_stop_sig - unobstructed_signature) > CAR_STOP_THRESH
-        car_is_moving = True
-        if is_obstructed:
-            if last_car_stop_sig is not None and np.linalg.norm(current_car_stop_sig - last_car_stop_sig) < CAR_STOP_THRESH:
-                stopped_frames_count += 1
-            else:
-                stopped_frames_count = 0
-            if stopped_frames_count > STOP_CONFIRM_FRAMES:
-                car_is_moving = False
-        else:
-            stopped_frames_count = 0
-        last_car_stop_sig = current_car_stop_sig
-
-        if not car_is_moving and not is_car_stopped:
-            is_car_stopped, stop_start_frame = True, frame_idx
-            # reset per-ROI release counters and fueler release counter
-            for s in tire_roi_states:
-                s['release_counter'] = 0
-            fueler_state['release_counter'] = 0
-        elif car_is_moving and is_car_stopped:
-            is_car_stopped, is_refueling_state, refuel_bbox = False, False, None
-            total_stopped_time += (frame_idx - stop_start_frame) / fps
-            stop_start_frame = 0
-
-        # Update crew tracker with detections (integration point)
-        tracker.update(person_dets, person_crops, frame, frame_idx, stop_start_frame if is_car_stopped else None)
-
-        # Apply manual annotations for this frame (if any). This will force-track labeling and seed templates.
-        ann_list = annotations.get(frame_idx, [])
-        if ann_list:
-            try:
-                apply_annotations_to_tracker(tracker, ann_list, frame, frame_idx, iou_thresh=0.25, add_template=True)
-            except Exception:
-                # don't crash on annotation failures; continue processing
-                pass
-
-        counted_refuel_this_frame = False  # ensure we only add refuel_time once per frame
-
-        # ---------- If car stopped, evaluate tire activity using tracker.tracks ----------
-        if is_car_stopped:
-            # legacy person-ROI fallback counting (keeps previous behavior)
-            if sum(boxes_overlap_area(p, troi) for p in person_dets for troi in tire_rois) > 500:
-                tire_change_time += 1.0 / fps
-
-            # Fueler-based fueling detection (prefer this over probe-template when crew tracker identifies a fueler)
-            fueler_tid = None
-            for tid, t in tracker.tracks.items():
-                if t.get('role') == 'fueler' or (t.get('label') and 'fuel' in t.get('label', '').lower()):
-                    fueler_tid = tid
-                    break
-
-            # If a fueler track exists, check overlap with refuel ROI
-            if fueler_tid is not None:
-                t = tracker.tracks[fueler_tid]
-                if 'bbox' in t:
-                    bx1, by1, bx2, by2 = t['bbox']
-                    overlap_area = boxes_overlap_area((bx1,by1,bx2,by2), refuel_roi_in_air)
-                    if overlap_area > 0:
-                        # fueler is at the refuel ROI -> start or continue fueling
-                        if not fueler_state['in_fuel']:
-                            fueler_state['in_fuel'] = True
-                            fueler_state['start_frame'] = frame_idx
-                            fueler_state['initiating_track'] = fueler_tid
-                            fueler_state['release_counter'] = 0
-                        else:
-                            fueler_state['release_counter'] = 0
-                        # count fueling time this frame
-                        refuel_time += 1.0 / fps
-                        counted_refuel_this_frame = True
-                        # annotate
-                        display_label = t.get('role') or t.get('label') or f"ID{fueler_tid}"
-                        cv2.putText(annotated_frame, f"FUELER {display_label}", (bx1, by1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,255), 2)
-                        cv2.rectangle(annotated_frame, (bx1, by1), (bx2, by2), (0,0,255), 2)
-                    else:
-                        # not overlapping: if currently fueling, start release countdown
-                        if fueler_state['in_fuel']:
-                            fueler_state['release_counter'] += 1
-                            if fueler_state['release_counter'] >= FUELER_RELEASE_FRAMES:
-                                # finalize fueling
-                                fueler_state['in_fuel'] = False
-                                # compute duration
-                                if fueler_state['start_frame'] is not None:
-                                    duration = (frame_idx - fueler_state['start_frame']) / fps
-                                    fueler_state['completed_fills'].append((fueler_state['initiating_track'], duration))
-                                fueler_state['start_frame'] = None
-                                fueler_state['initiating_track'] = None
-                                fueler_state['release_counter'] = 0
-                            else:
-                                # still in release window, keep counting as fueling (optional)
-                                refuel_time += 1.0 / fps
-                                counted_refuel_this_frame = True
-                                # visual feedback
-                                cv2.rectangle(annotated_frame, (int(refuel_roi_in_air[0]), int(refuel_roi_in_air[1])),
-                                              (int(refuel_roi_in_air[2]), int(refuel_roi_in_air[3])), (0,150,200), 2)
-
-            # If no fueler-based detection counted fueling this frame, fall back to probe-template detection
-            if not counted_refuel_this_frame:
-                if refuel_bbox is None:
-                    x, y, w, h = refuel_roi_in_air
-                    sx1, sy1 = max(0, int(x)), max(0, int(y))
-                    sx2, sy2 = min(width, int(x + w)), min(height, int(y + h))
-                    if sx2 > sx1 and sy2 > sy1:
-                        search_area_gray = cv2.cvtColor(frame[sy1:sy2, sx1:sx2], cv2.COLOR_BGR2GRAY)
-                        best_in_score, best_in_idx, best_in_t = best_match_template(search_area_gray, probe_in_templates)
-                        best_out_score, best_out_idx, best_out_t = best_match_template(search_area_gray, probe_out_templates)
-                        best_in_score = best_in_score if best_in_score is not None else -1.0
-                        best_out_score = best_out_score if best_out_score is not None else -1.0
-                        DECISION_THRESH = 0.7
-                        if best_in_score > best_out_score and best_in_score >= DECISION_THRESH:
-                            active_probe_template = best_in_t
-                            mx, my = best_in_idx
-                            active_template_h, active_template_w = active_probe_template.shape[:2]
-                            refuel_bbox = (sx1 + int(mx), sy1 + int(my), active_template_w, active_template_h)
-                            is_refueling_state = True
-                            # count probe-based fuel time
-                            refuel_time += 1.0 / fps
-                            counted_refuel_this_frame = True
-                else:
-                    search_pad = 40
-                    x, y, w, h = refuel_bbox
-                    sx1, sy1 = max(0, int(x - search_pad)), max(0, int(y - search_pad))
-                    sx2, sy2 = min(width, int(x + w + search_pad)), min(height, int(y + h + search_pad))
-                    win_w = sx2 - sx1; win_h = sy2 - sy1
-                    if active_probe_template is None or win_w < active_template_w or win_h < active_template_h:
-                        is_refueling_state = False
-                        refuel_bbox = None
-                        active_probe_template = None
-                        active_template_w = None
-                        active_template_h = None
-                    else:
-                        search_window = frame[sy1:sy2, sx1:sx2]
-                        search_window_gray = cv2.cvtColor(search_window, cv2.COLOR_BGR2GRAY)
-                        res = cv2.matchTemplate(search_window_gray, active_probe_template, cv2.TM_CCOEFF_NORMED)
-                        if res is None:
-                            is_refueling_state = False
-                            refuel_bbox = None
-                            active_probe_template = None
-                        else:
-                            _, score, _, max_loc = cv2.minMaxLoc(res)
-                            if score > TRACK_LOST_THRESHOLD:
-                                is_refueling_state = True
-                                refuel_bbox = (sx1 + int(max_loc[0]), sy1 + int(max_loc[1]), active_template_w, active_template_h)
-                                p1 = (int(refuel_bbox[0]), int(refuel_bbox[1])); p2 = (int(refuel_bbox[0] + refuel_bbox[2]), int(refuel_bbox[1] + refuel_bbox[3]))
-                                cv2.rectangle(annotated_frame, p1, p2, (255, 0, 255), 3, 1)
-                                # count probe-based refuel time
-                                refuel_time += 1.0 / fps
-                                counted_refuel_this_frame = True
-                            else:
-                                is_refueling_state = False
-                                refuel_bbox = None
-
-            # ---------- Tire activity attribution using tracker.tracks ----------
-            if last_gray is not None:
-                for tid, t in tracker.tracks.items():
-                    if 'bbox' not in t:
-                        continue
-                    bx1, by1, bx2, by2 = t['bbox']
-                    bx1, by1, bx2, by2 = max(0, bx1), max(0, by1), min(width-1, bx2), min(height-1, by2)
-                    if bx2 <= bx1 or by2 <= by1:
-                        continue
-                    prev_patch = last_gray[by1:by2, bx1:bx2]
-                    curr_patch = curr_gray[by1:by2, bx1:bx2]
-                    motion_amt = 0.0
-                    if prev_patch.size and curr_patch.size and prev_patch.shape == curr_patch.shape:
-                        motion_amt = float(np.mean(cv2.absdiff(prev_patch, curr_patch)))
-
-                    # check each tire ROI for overlap with this track
-                    for ridx, troi in enumerate(tire_rois):
-                        tx1, ty1, tx2, ty2 = troi
-                        overlap_area = boxes_overlap_area((bx1,by1,bx2,by2), troi)
-                        active_signal = False
-                        if overlap_area > 0:
-                            if motion_amt > MOTION_THRESH:
-                                active_signal = True
-                            if t.get('tire_frames', {}).get(ridx, 0) >= TIRES_FRAMES_TO_COUNT:
-                                active_signal = True
-
-                        roi_state = tire_roi_states[ridx]
-
-                        if active_signal:
-                            roi_state['latched'] = True
-                            roi_state['release_counter'] = 0
-                            roi_state['last_active_frame'] = frame_idx
-                            roi_state['active_track_id'] = tid
-                            # prefer the tracked role
-                            role = t.get('role') or roi_state.get('initiating_role')
-                            if roi_state.get('initiating_role') is None and t.get('role'):
-                                roi_state['initiating_role'] = t.get('role')
-                            # count time continuously while latched
-                            roi_state['cumulative_time'] += 1.0 / fps
-                            tire_change_time += 1.0 / fps
-                            # attribute to the role-based accumulators
-                            if role == 'front_tire_changer':
-                                front_tire_time += 1.0 / fps
-                            elif role == 'rear_tire_changer':
-                                rear_tire_time += 1.0 / fps
-                            else:
-                                # if role is unknown, try to infer from initiator role stored on ROI
-                                init_role = roi_state.get('initiating_role')
-                                if init_role == 'front_tire_changer':
-                                    front_tire_time += 1.0 / fps
-                                elif init_role == 'rear_tire_changer':
-                                    rear_tire_time += 1.0 / fps
-                            # also attribute to the track if supported
-                            if 'tire_cumulative' in t:
-                                t['tire_cumulative'][ridx] = t.get('tire_cumulative', {}).get(ridx, 0.0) + 1.0 / fps
-                            display_label = role or t.get('label') or f"ID{tid}"
-                            cv2.rectangle(annotated_frame, (tx1, ty1), (tx2, ty2), (0,255,0), 2)
-                            cv2.putText(annotated_frame, f"{display_label}", (bx1, by1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0), 2)
-                            cv2.rectangle(annotated_frame, (bx1, by1), (bx2, by2), (0,255,0), 2)
-                        else:
-                            if roi_state['latched']:
-                                roi_state['release_counter'] += 1
-                                if roi_state['release_counter'] >= TIRE_RELEASE_FRAMES:
-                                    roi_state['latched'] = False
-                                    roi_state['release_counter'] = 0
-                                    roi_state['active_track_id'] = None
-                                    cv2.rectangle(annotated_frame, (tx1, ty1), (tx2, ty2), (0,255,255), 1)
-                                else:
-                                    cv2.rectangle(annotated_frame, (tx1, ty1), (tx2, ty2), (0,200,50), 2)
-                            else:
-                                cv2.rectangle(annotated_frame, (tx1, ty1), (tx2, ty2), (0,255,255), 1)
-
-        # ---------- Drawing overlays ----------
-        cv2.rectangle(annotated_frame, ref_roi, (0,255,255), 2)
-        cv2.rectangle(annotated_frame, refuel_roi_in_air, (0,0,255), 2)
-
-        # Draw tracks with role & hop info (from tracker)
-        for tid, t in tracker.tracks.items():
-            if 'bbox' not in t:
-                continue
-            bx1,by1,bx2,by2 = t['bbox']
-            label = t.get('role') or t.get('label') or f"ID{tid}"
-            info = f"{label}"
-            if t.get('hopped'):
-                hop_time = t.get('hop_time')
-                try:
-                    hop_display = f" hop:{hop_time:.2f}s" if hop_time is not None else ""
-                except Exception:
-                    hop_display = f" hop:{hop_time}"
-                info += hop_display
-            cv2.putText(annotated_frame, info, (bx1, by1-18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1)
-            cv2.rectangle(annotated_frame, (bx1,by1), (bx2,by2), (200,200,200), 1)
-
-        # Per-ROI overlays & cumulative times
-        overlay_x = 20
-        overlay_y = height // 2 - 80
-        for ridx, troi in enumerate(tire_rois):
-            rx1, ry1, rx2, ry2 = troi
-            cv2.rectangle(annotated_frame, (rx1, ry1), (rx2, ry2), (255,255,0), 1)
-            text_time = tire_roi_states[ridx]['cumulative_time']
-            initiator = tire_roi_states[ridx].get('initiating_role')
-            text = f"R{ridx+1} {text_time:.2f}s"
-            if initiator:
-                text = f"{initiator}: {text_time:.2f}s"
-            cv2.putText(annotated_frame, text, (overlay_x, overlay_y + ridx*22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,0,0), 2)
-
-        # status overlay (added front/rear times)
-        rect_x, rect_y, rect_w, rect_h = 20, height // 2 + 20, 620, 160
-        overlay = annotated_frame.copy()
-        cv2.rectangle(overlay, (rect_x, rect_y), (rect_x + rect_w, rect_y + rect_h), (0,255,255), -1)
-        annotated_frame = cv2.addWeighted(overlay, 0.45, annotated_frame, 0.55, 0)
-        current_display_stop_time = total_stopped_time + ((frame_idx - stop_start_frame)/fps if is_car_stopped else 0)
-        cv2.putText(annotated_frame, f'Car Stopped: {current_display_stop_time:.2f}s', (rect_x + 10, rect_y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,0,0), 2)
-        cv2.putText(annotated_frame, f'Tire Change: {tire_change_time:.2f}s', (rect_x + 10, rect_y + 60), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
-        cv2.putText(annotated_frame, f'Front Tire: {front_tire_time:.2f}s', (rect_x + 10, rect_y + 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 2)
-        cv2.putText(annotated_frame, f'Rear Tire: {rear_tire_time:.2f}s', (rect_x + 10, rect_y + 115), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,0), 2)
-        cv2.putText(annotated_frame, f'Refueling: {refuel_time:.2f}s', (rect_x + 10, rect_y + 140), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2)
-
-        out.write(annotated_frame)
-
-        last_gray = curr_gray.copy()
-
-    # finalize
-    if is_car_stopped:
-        total_stopped_time += (total_frames - stop_start_frame) / fps
+        telemetry_data.append({
+            "Frame": frame_idx,
+            "Time": frame_idx / fps,
+            "Flow_X": flow_x,
+            "Zoom_Score": zoom_score,
+            "S_In": score_in,
+            "S_Out": score_out,
+            "Fueler_Present": fueler_present,
+            "Fuel_Box": fuel_box,
+            "Act_TL": act_tl, "Act_TR": act_tr,
+            "Act_BL": act_bl, "Act_BR": act_br
+        })
+        
+        prev_roi = curr_roi
+        frame_idx += 1
+        if frame_idx % 50 == 0: progress_callback(frame_idx / total_frames)
 
     cap.release()
-    out.release()
+    return pd.DataFrame(telemetry_data), fps, width, height
 
-    # return per-role times along with existing totals
-    return total_stopped_time, tire_change_time, refuel_time, front_tire_time, rear_tire_time
+# --- PASS 2: Analysis V50 (Reference Integrated) ---
+def analyze_states_v50(df, fps):
+    window = 15
+    cols = ['Flow_X', 'Zoom_Score', 'S_In', 'S_Out', 'Fueler_Present', 
+            'Act_TL', 'Act_TR', 'Act_BL', 'Act_BR']
+    for col in cols:
+        if len(df) > window:
+            df[f'{col}_Sm'] = savgol_filter(df[col], window, 3)
+        else:
+            df[f'{col}_Sm'] = df[col]
+
+    df['Zoom_Vel'] = np.gradient(df['Zoom_Score_Sm'])
+
+    # 1. PIT STOP
+    x_mag = df['Flow_X_Sm'].abs()
+    peaks, _ = find_peaks(x_mag, height=x_mag.max()*0.3, distance=fps*5)
+    t_start, t_end = None, None
+    arrival_dir = 0 
+    
+    if len(peaks) >= 2:
+        arrival_idx = peaks[0]
+        depart_idx = peaks[-1]
+        arr_flow = df['Flow_X_Sm'].iloc[arrival_idx]
+        arrival_dir = 1 if arr_flow > 0 else -1 
+        
+        for i in range(arrival_idx, depart_idx):
+            if x_mag.iloc[i] < x_mag.max()*0.05:
+                t_start = df.iloc[i]['Time']
+                break
+        for i in range(depart_idx, arrival_idx, -1):
+            if x_mag.iloc[i] < x_mag.max()*0.05:
+                t_end = df.iloc[i]['Time']
+                break
+
+    # 2. JACKS
+    t_up, t_down = None, None
+    if t_start and t_end:
+        t_creep = t_end - 1.0
+        stop_window = df[(df['Time'] >= t_start) & (df['Time'] <= t_creep)]
+        
+        if not stop_window.empty:
+            z_pos = stop_window['Zoom_Score_Sm'].values
+            z_vel = stop_window['Zoom_Vel'].values
+            times = stop_window['Time'].values
+            
+            peaks_up, _ = find_peaks(z_pos, height=0.2, distance=fps)
+            if len(peaks_up) > 0: t_up = times[peaks_up[0]]
+            else: t_up = t_start
+                
+            mask_drop = times > t_up + 2.0 
+            if np.any(mask_drop):
+                drop_vel = z_vel[mask_drop]
+                drop_times = times[mask_drop]
+                min_idx = np.argmin(drop_vel)
+                if drop_vel[min_idx] < -0.02: t_down = drop_times[min_idx]
+                else: t_down = t_end
+            else: t_down = t_end
+
+    # 3. CORNER TIMING
+    map_corners = {}
+    if arrival_dir > 0: 
+        map_corners['Inside Rear'] = 'Act_BL_Sm'; map_corners['Outside Rear'] = 'Act_TL_Sm'
+        map_corners['Inside Front'] = 'Act_BR_Sm'; map_corners['Outside Front'] = 'Act_TR_Sm'
+    else: 
+        map_corners['Inside Rear'] = 'Act_BR_Sm'; map_corners['Outside Rear'] = 'Act_TR_Sm'
+        map_corners['Inside Front'] = 'Act_BL_Sm'; map_corners['Outside Front'] = 'Act_TL_Sm'
+
+    corner_stats = {}
+    
+    if t_up and t_down:
+        t_ae = t_end 
+        df_j = df[(df['Time'] >= t_up) & (df['Time'] <= t_ae)]
+        times_j = df_j['Time'].values
+        
+        def get_window(sig, start_g, end_g, sens):
+            mask = (times_j >= start_g) & (times_j <= end_g)
+            if not np.any(mask): return start_g, start_g
+            s_win = sig[mask]
+            t_win = times_j[mask]
+            base = np.percentile(s_win, 10)
+            peak = np.max(s_win)
+            if peak < 0.5: return start_g, start_g
+            
+            t_s = base + (peak-base) * sens
+            t_e = base + (peak-base) * 0.20
+            
+            active = np.where(s_win > t_s)[0]
+            if len(active) == 0: return start_g, start_g
+            i_start = active[0]
+            
+            peak_idx = np.argmax(s_win)
+            search_s = max(i_start, peak_idx)
+            i_end = len(s_win)-1
+            buf = int(fps*0.5)
+            for i in range(search_s, len(s_win)-buf):
+                if s_win[i] < t_e and np.mean(s_win[i:i+buf]) < t_e:
+                    i_end = i
+                    break
+            return t_win[i_start], t_win[i_end]
+
+        # A. FRONT
+        sig_of = df_j[map_corners['Outside Front']].values
+        sig_if = df_j[map_corners['Inside Front']].values
+        t_of_start, t_of_end = get_window(sig_of, t_up, t_ae, 0.3)
+        t_if_start, t_if_end = get_window(sig_if, t_of_start+1.5, t_ae, 0.3)
+        corner_stats['Outside Front'] = (t_of_start, t_of_end)
+        corner_stats['Inside Front'] = (t_if_start, t_if_end)
+        
+        # B. REAR
+        sig_ir = df_j[map_corners['Inside Rear']].values
+        sig_or = df_j[map_corners['Outside Rear']].values
+        
+        t_or_start, t_or_end = get_window(sig_or, t_up + 2.5, t_ae, sens=0.55)
+        t_ir_start, t_ir_raw_end = get_window(sig_ir, t_up, t_ae, sens=0.15)
+        
+        if t_or_start > t_up + 3.0:
+            if t_ir_raw_end < t_or_start:
+                t_ir_end = t_ir_raw_end
+            else:
+                t_ir_end = t_or_start - 1.0
+                if t_ir_end < t_ir_start + 1.5: t_ir_end = t_ir_start + 1.5
+            t_trans_start = t_ir_end
+            t_trans_end = t_or_start
+        else:
+            t_ir_end = t_ir_raw_end
+            t_trans_start, t_trans_end = t_ir_end, t_ir_end
+            
+        corner_stats['Inside Rear'] = (t_ir_start, t_ir_end)
+        corner_stats['Rear Transition'] = (t_trans_start, t_trans_end)
+        corner_stats['Outside Rear'] = (t_or_start, t_or_end)
+
+    # 4. FUEL (Reference Logic Integrated)
+    t_fuel_start, t_fuel_end = None, None
+    
+    if t_start and t_end:
+        fuel_w = df[(df['Time'] >= t_start) & (df['Time'] <= t_end)]
+        if not fuel_w.empty:
+            s_in = fuel_w['S_In_Sm'].values
+            s_out = fuel_w['S_Out_Sm'].values
+            person = fuel_w['Fueler_Present_Sm'].values # >0 means yes
+            times = fuel_w['Time'].values
+            
+            # LOGIC V50:
+            # 1. Person must be present (person > 0.5)
+            # 2. Probe IN score must be high (> 0.6)
+            # 3. Probe IN must be > Probe OUT (Comparison)
+            
+            is_fueling = (person > 0.5) & (s_in > 0.6) & (s_in > s_out)
+            
+            indices = np.where(is_fueling)[0]
+            
+            if len(indices) > int(fps * 1.5): # Sustained for 1.5s
+                t_fuel_start = times[indices[0]]
+                
+                # Find end
+                diffs = np.diff(indices)
+                splits = np.where(diffs > 15)[0]
+                end_idx = indices[splits[0]] if len(splits) > 0 else indices[-1]
+                
+                t_fuel_end = times[end_idx]
+                if t_fuel_end > t_end - 0.5: t_fuel_end = t_end - 0.5
+
+    if t_up is None: t_up = t_start
+    if t_down is None: t_down = t_end
+
+    return (t_start, t_end), (t_up, t_down), (t_fuel_start, t_fuel_end), corner_stats
+
+# --- PASS 3: Render ---
+def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, height, show_debug, progress_callback):
+    cap = cv2.VideoCapture(input_path)
+    temp_output = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v') 
+    out = cv2.VideoWriter(temp_output.name, fourcc, fps, (width, height))
+    
+    t_start, t_end = pit
+    t_up, t_down = tires
+    t_f_start, t_f_end = fuel
+    
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    frame_idx = 0
+    labels = ["Inside Rear", "Outside Rear", "Outside Front", "Inside Front"]
+    
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret: break
+        curr = frame_idx / fps
+        
+        # Timers
+        if t_start and curr >= t_start:
+            vp = (t_end - t_start) if (t_end and curr >= t_end) else (curr - t_start)
+            cp = (0,0,255) if (t_end and curr >= t_end) else (0,255,0)
+        else: vp, cp = 0.0, (200,200,200)
+
+        if t_up and curr >= t_up:
+            vt = (t_down - t_up) if (t_down and curr >= t_down) else (curr - t_up)
+            ct = (0,0,255) if (t_down and curr >= t_down) else (0,255,255)
+        else: vt, ct = 0.0, (200,200,200)
+
+        if t_f_start and curr >= t_f_start:
+            vf = (t_f_end - t_f_start) if (t_f_end and curr >= t_f_end) else (curr - t_f_start)
+            cf = (0,0,255) if (t_f_end and curr >= t_f_end) else (255,165,0)
+        else: vf, cf = 0.0, (200,200,200)
+        
+        # UI
+        cv2.rectangle(frame, (width-450, 0), (width, 360), (0,0,0), -1)
+        cv2.putText(frame, "PIT STOP", (width-430, 40), 0, 0.8, (255,255,255), 2)
+        cv2.putText(frame, f"{vp:.2f}s", (width-180, 40), 0, 1.2, cp, 3)
+        cv2.putText(frame, "FUELING", (width-430, 90), 0, 0.8, (255,255,255), 2)
+        cv2.putText(frame, f"{vf:.2f}s", (width-180, 90), 0, 1.2, cf, 3)
+        cv2.putText(frame, "TIRES (Total)", (width-430, 140), 0, 0.8, (255,255,255), 2)
+        cv2.putText(frame, f"{vt:.2f}s", (width-180, 140), 0, 1.2, ct, 3)
+
+        start_y = 180
+        gap_y = 30
+        trans_start, trans_end = corner_data.get("Rear Transition", (0,0))
+        
+        labels_ui = [
+            ("Inside Rear", "Inside Rear"),
+            ("TRANSITION", "  > Transition"),
+            ("Outside Rear", "Outside Rear"),
+            ("Outside Front", "Outside Front"),
+            ("Inside Front", "Inside Front")
+        ]
+        
+        for i, (key, display) in enumerate(labels_ui):
+            y_pos = start_y + (i*gap_y)
+            if key == "TRANSITION":
+                c_start, c_end = trans_start, trans_end
+                label_col = (255, 255, 0)
+            else:
+                c_start, c_end = corner_data.get(key, (0.0, 0.0))
+                label_col = (255, 255, 255)
+            
+            c_val = 0.0
+            if c_start > 0 and curr >= c_start:
+                val = (c_end - c_start) if (curr >= c_end) else (curr - c_start)
+                c_val = max(0.0, val)
+            
+            txt_col = label_col if c_val > 0 else (100,100,100)
+            cv2.putText(frame, display, (width-430, y_pos), 0, 0.6, txt_col, 1)
+            cv2.putText(frame, f"{c_val:.2f}s", (width-100, y_pos), 0, 0.6, txt_col, 2)
+
+        if show_debug:
+            safe_idx = min(frame_idx, len(df)-1)
+            row = df.iloc[safe_idx]
+            sc = row['S_In_Sm']
+            ppl = row['Fueler_Present_Sm']
+            cv2.putText(frame, f"P:{sc:.2f} H:{ppl:.1f}", (width-430, 330), 0, 0.5, (0, 255, 255), 1)
+            
+            fb = row['Fuel_Box']
+            if fb is not None:
+                x,y,w,h = fb
+                cv2.rectangle(frame, (x,y), (x+w, y+h), (0,255,255), 2)
+
+        out.write(frame)
+        frame_idx += 1
+        if frame_idx % 50 == 0: progress_callback(frame_idx / total_frames)
+            
+    cap.release()
+    out.release()
+    return temp_output.name
+
+# --- Main ---
+def main():
+    st.title("🏁 Pit Stop Analyzer V50")
+    st.markdown("### Reference-Integrated Fuel Logic")
+    st.info("Fueling requires: **Person (Fueler) Present** AND **'Probe In' match > 'Probe Out' match**.")
+
+    show_debug = st.sidebar.checkbox("Show Debug Info", value=False)
+
+    missing = []
+    for r in ["probein", "probeout", "emptyfuelport"]:
+        p = os.path.join(BASE_DIR, "refs", r)
+        if not os.path.exists(p) and not glob.glob(p+".*"): missing.append(r)
+    if missing: st.error(f"Missing refs: {missing}")
+
+    if 'analysis_done' not in st.session_state:
+        st.session_state.update({'analysis_done': False, 'df': None, 'video_path': None, 'timings': None})
+
+    uploaded_file = st.file_uploader("Upload Overhead Video", type=["mp4", "mov", "avi"])
+
+    if uploaded_file and st.button("Start Analysis", type="primary"):
+        st.session_state['analysis_done'] = False
+        tfile = tempfile.NamedTemporaryFile(delete=False, suffix='.mp4')
+        tfile.write(uploaded_file.read())
+        tfile.flush()
+        
+        try:
+            bar = st.progress(0)
+            st.write("Step 1: Extraction (Flow, Zoom, Person, Templates)...")
+            df, fps, w, h = extract_telemetry(tfile.name, bar.progress)
+            
+            st.write("Step 2: Analysis...")
+            pit_t, tire_t, fuel_t, corners = analyze_states_v50(df, fps)
+            
+            if pit_t[0] is None:
+                st.error("Could not detect Stop.")
+            else:
+                st.write("Step 3: Rendering Video...")
+                vid_path = render_overlay(tfile.name, pit_t, tire_t, fuel_t, corners, df, fps, w, h, show_debug, bar.progress)
+                
+                st.session_state.update({
+                    'df': df, 'video_path': vid_path, 
+                    'timings': (pit_t, tire_t, fuel_t, corners), 'analysis_done': True
+                })
+            bar.empty()
+        except Exception as e:
+            st.error(f"Error: {e}")
+        finally:
+            if os.path.exists(tfile.name): os.remove(tfile.name)
+
+    if st.session_state['analysis_done']:
+        df = st.session_state['df']
+        vid_path = st.session_state['video_path']
+        pit_t, tire_t, fuel_t, corners = st.session_state['timings']
+        
+        st.divider()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Pit Stop Time", f"{pit_t[1] - pit_t[0]:.2f}s")
+        f_dur = (fuel_t[1] - fuel_t[0]) if (fuel_t[0] and fuel_t[1]) else 0
+        c2.metric("Fueling Time", f"{f_dur:.2f}s" if f_dur > 0 else "N/A")
+        t_dur = (tire_t[1] - tire_t[0]) if (tire_t[0] and tire_t[1]) else 0
+        c3.metric("Tire Change Time", f"{t_dur:.2f}s")
+        
+        st.write("### 🛞 Rear Breakdown")
+        c_ir = corners.get('Inside Rear', (0,0))
+        c_or = corners.get('Outside Rear', (0,0))
+        c_tr = corners.get('Rear Transition', (0,0))
+        
+        t1, t2, t3 = st.columns(3)
+        t1.metric("Inside Rear", f"{c_ir[1]-c_ir[0]:.2f}s")
+        t2.metric("Transition", f"{c_tr[1]-c_tr[0]:.2f}s")
+        t3.metric("Outside Rear", f"{c_or[1]-c_or[0]:.2f}s")
+        
+        st.subheader("Video Result")
+        c1, c2 = st.columns([3,1])
+        with c1:
+            if os.path.exists(vid_path): st.video(vid_path)
+        with c2:
+            if os.path.exists(vid_path):
+                with open(vid_path, 'rb') as f:
+                    st.download_button("Download MP4", f, file_name="pitstop_v50.mp4")
+
+if __name__ == "__main__":
+    main()
