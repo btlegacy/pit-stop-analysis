@@ -66,7 +66,6 @@ def extract_telemetry(video_path, progress_callback):
         flow = cv2.calcOpticalFlowFarneback(prev_roi, curr_roi, None, 0.5, 3, 15, 3, 5, 1.2, 0)
         fx = flow[..., 0]
         fy = flow[..., 1]
-        
         mag = np.sqrt(fx**2 + fy**2)
         active = mag > 1.0 
         flow_x = np.median(fx[active]) if np.any(active) else 0.0
@@ -78,17 +77,16 @@ def extract_telemetry(video_path, progress_callback):
         val_r = np.median(f_right[np.abs(f_right)>0.5]) if np.any(np.abs(f_right)>0.5) else 0.0
         zoom_score = val_r - val_l
         
-        # 3. 4-Corner (Activity & Direction)
+        # 3. 4-Corner
         h_roi, w_roi = curr_roi.shape
         mid_h, mid_w = h_roi // 2, w_roi // 2
-        
         q_mag = mag 
         act_tl = np.mean(q_mag[:mid_h, :mid_w])
         act_tr = np.mean(q_mag[:mid_h, mid_w:])
         act_bl = np.mean(q_mag[mid_h:, :mid_w])
         act_br = np.mean(q_mag[mid_h:, mid_w:])
         
-        # Vertical Flow per corner (for movement detection)
+        # Vertical Flow per corner (Direction)
         q_fy = fy
         fy_tl = np.mean(q_fy[:mid_h, :mid_w])
         fy_tr = np.mean(q_fy[:mid_h, mid_w:])
@@ -97,7 +95,7 @@ def extract_telemetry(video_path, progress_callback):
         
         # 4. Fuel
         score_in = 0.0
-        fuel_box = None 
+        fuel_box = None
         
         results = model.track(frame, persist=True, classes=[2], verbose=False, conf=0.15)
         if results[0].boxes.id is not None:
@@ -137,7 +135,7 @@ def extract_telemetry(video_path, progress_callback):
             "Fuel_Box": fuel_box, 
             "Act_TL": act_tl, "Act_TR": act_tr,
             "Act_BL": act_bl, "Act_BR": act_br,
-            "Fy_TL": fy_tl, "Fy_TR": fy_tr,
+            "Fy_TL": fy_tl, "Fy_TR": fy_tr, 
             "Fy_BL": fy_bl, "Fy_BR": fy_br
         })
         
@@ -148,8 +146,8 @@ def extract_telemetry(video_path, progress_callback):
     cap.release()
     return pd.DataFrame(telemetry_data), fps, width, height
 
-# --- PASS 2: Analysis ---
-def analyze_states_v52(df, fps):
+# --- PASS 2: Analysis V53 (Gun-Spike Logic) ---
+def analyze_states_v53(df, fps):
     window = 15
     cols = ['Flow_X', 'Zoom_Score', 'S_In', 'Act_TL', 'Act_TR', 'Act_BL', 'Act_BR',
             'Fy_TL', 'Fy_TR', 'Fy_BL', 'Fy_BR']
@@ -176,12 +174,13 @@ def analyze_states_v52(df, fps):
         arr_flow = df['Flow_X_Sm'].iloc[arrival_idx]
         arrival_dir = 1 if arr_flow > 0 else -1 
         
+        STOP_THRESH = x_mag.max() * 0.05
         for i in range(arrival_idx, depart_idx):
-            if x_mag.iloc[i] < x_mag.max()*0.05:
+            if x_mag.iloc[i] < STOP_THRESH:
                 t_start = df.iloc[i]['Time']
                 break
         for i in range(depart_idx, arrival_idx, -1):
-            if x_mag.iloc[i] < x_mag.max()*0.05:
+            if x_mag.iloc[i] < STOP_THRESH:
                 t_end = df.iloc[i]['Time']
                 break
 
@@ -209,7 +208,7 @@ def analyze_states_v52(df, fps):
                 else: t_down = t_end
             else: t_down = t_end
 
-    # 3. CORNER TIMING (V52 Movement Vector Logic)
+    # 3. CORNER TIMING
     def get_window(sig, start_g, end_g, sens):
         mask = (df['Time'] >= start_g) & (df['Time'] <= end_g)
         if not np.any(mask): return start_g, start_g
@@ -236,8 +235,34 @@ def analyze_states_v52(df, fps):
                 break
         return t_win[i_start], t_win[i_end]
 
+    # Specific "Gun Spike" Detection for Outside Rear
+    def find_gun_start(sig, start_g, end_g):
+        # Look for sudden spike in Derivative (Acceleration of activity)
+        mask = (df['Time'] >= start_g) & (df['Time'] <= end_g)
+        if not np.any(mask): return start_g
+        
+        s_win = sig[mask]
+        t_win = df['Time'][mask].values
+        
+        # Rate of change
+        grad = np.gradient(s_win)
+        
+        # Find the first major positive spike in activity (Gun On)
+        # Threshold: The spike must be sharp (> 30% of max gradient)
+        max_grad = np.max(grad)
+        thresh_spike = max_grad * 0.3
+        
+        spikes = np.where(grad > thresh_spike)[0]
+        
+        if len(spikes) > 0:
+            return t_win[spikes[0]]
+        else:
+            # Fallback to standard threshold
+            t_s, _ = get_window(sig, start_g, end_g, 0.5)
+            return t_s
+
     map_act = {}
-    map_fy = {} # Vertical Flow for Movement Detection
+    map_fy = {}
     if arrival_dir > 0: 
         map_act['Inside Rear'] = 'Act_BL_Sm'; map_fy['Inside Rear'] = 'Fy_BL_Sm'
         map_act['Outside Rear'] = 'Act_TL_Sm'; map_fy['Outside Rear'] = 'Fy_TL_Sm'
@@ -261,58 +286,47 @@ def analyze_states_v52(df, fps):
         corner_stats['Outside Front'] = (ts_of, te_of)
         corner_stats['Inside Front'] = (ts_if, te_if)
         
-        # B. REAR (Movement Vector Logic)
+        # Rear
         ir = df[map_act['Inside Rear']].values
         or_ = df[map_act['Outside Rear']].values
-        fy_ir = df[map_fy['Inside Rear']].values # Vertical flow at Inside Rear
+        fy_ir = df[map_fy['Inside Rear']].values
         
-        # 1. Outside Rear (Gun On) - High Sensitivity (0.55)
-        ts_or, te_or = get_window(or_, t_up+2.5, t_ae, 0.55)
-        
-        # 2. Inside Rear Start
+        # 1. IR Start (Sensitive)
         ts_ir, _ = get_window(ir, t_up, t_ae, 0.15)
         
-        # 3. Inside Rear End (Movement Detection)
-        # Look in the gap between IR Start and OR Start
-        # We look for a spike in NEGATIVE Vertical Flow (Moving Up towards Outside)
-        # OpenCV Y is Down-Pos, so Up is Negative.
+        # 2. OR Start (GUN SPIKE LOGIC)
+        # Look for the "Gun On" moment specifically
+        ts_or = find_gun_start(or_, t_up + 3.0, t_ae)
         
-        search_start = ts_ir + 1.5
+        # Find OR End
+        _, te_or = get_window(or_, ts_or, t_ae, 0.3)
+        
+        # 3. IR End (Movement Vector / Transition)
+        # Look for upward movement in the gap
         search_end = ts_or
+        search_start = max(ts_ir + 1.5, search_end - 2.0) # Look in 2s window before OR start
         
-        if search_end > search_start:
-            mask_gap = (df['Time'] >= search_start) & (df['Time'] <= search_end)
-            if np.any(mask_gap):
-                fy_gap = fy_ir[mask_gap] # Vertical movement
-                t_gap = df['Time'][mask_gap].values
-                
-                # Find peak upward movement (Minimum Fy)
-                # "Moving along the wing" = fast upward movement in the frame
-                min_idx = np.argmin(fy_gap)
-                min_val = fy_gap[min_idx]
-                
-                # Threshold: -0.5 is a decent "Running" speed
-                if min_val < -0.5:
-                    # The moment they START moving is the end of IR work
-                    # We find where the velocity starts dipping
-                    # Simple approximation: Peak Velocity time
-                    te_ir = t_gap[min_idx]
-                else:
-                    # No clear movement? Fallback to transition start = OR start - transit time
-                    te_ir = ts_or - 1.4
+        mask_gap = (df['Time'] >= search_start) & (df['Time'] <= search_end)
+        if np.any(mask_gap):
+            fy_gap = fy_ir[mask_gap]
+            t_gap = df['Time'][mask_gap].values
+            
+            # Find peak upward movement
+            min_idx = np.argmin(fy_gap)
+            if fy_gap[min_idx] < -0.5:
+                te_ir = t_gap[min_idx]
             else:
-                te_ir = ts_or - 1.4
+                # If no clear movement vector, assume transition took ~1.2s
+                te_ir = max(ts_ir+2.0, ts_or - 1.2)
         else:
-            te_ir = ts_or - 1.4
+            te_ir = ts_or - 1.2
             
-        # Safety clamp
-        if te_ir < ts_ir + 1.5: te_ir = ts_ir + 1.5
+        # Safety Clamps
+        if te_ir > ts_or: te_ir = ts_or - 0.5
+        if te_ir < ts_ir + 2.0: te_ir = ts_ir + 2.0
         
-        t_trans_start = te_ir
-        t_trans_end = ts_or
-            
         corner_stats['Inside Rear'] = (ts_ir, te_ir)
-        corner_stats['Rear Transition'] = (t_trans_start, t_trans_end)
+        corner_stats['Rear Transition'] = (te_ir, ts_or)
         corner_stats['Outside Rear'] = (ts_or, te_or)
 
     # 4. FUEL
@@ -324,7 +338,7 @@ def analyze_states_v52(df, fps):
             times = fuel_w['Time'].values
             is_fueling = s_in > 0.50
             indices = np.where(is_fueling)[0]
-            if len(indices) > int(fps * 1.5):
+            if len(indices) > int(fps * 2.0):
                 t_fuel_start = times[indices[0]]
                 diffs = np.diff(indices)
                 splits = np.where(diffs > 20)[0]
@@ -350,6 +364,7 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
     
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     frame_idx = 0
+    
     labels = ["Inside Rear", "Outside Rear", "Outside Front", "Inside Front"]
     
     while cap.isOpened():
@@ -417,7 +432,7 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
             row = df.iloc[safe_idx]
             sc = row.get('S_In_Sm', 0.0)
             ppl = row.get('Fueler_Present_Sm', 0.0)
-            cv2.putText(frame, f"P:{sc:.2f}", (width-430, 330), 0, 0.5, (0, 255, 255), 1)
+            cv2.putText(frame, f"P:{sc:.2f} H:{ppl:.1f}", (width-430, 330), 0, 0.5, (0, 255, 255), 1)
             
             fb = row.get('Fuel_Box')
             if fb is not None and not pd.isna(fb):
@@ -434,9 +449,9 @@ def render_overlay(input_path, pit, tires, fuel, corner_data, df, fps, width, he
 
 # --- Main ---
 def main():
-    st.title("🏁 Pit Stop Analyzer V52")
-    st.markdown("### Movement-Vector Transition")
-    st.info("Detects the **Vertical Flow (Fy)** of the Rear Changer moving 'up' the screen (along the wing) to trigger Transition.")
+    st.title("🏁 Pit Stop Analyzer V53")
+    st.markdown("### Gun-Spike Logic")
+    st.info("Detects 'Gun On' for Outside Rear (Sharp Activity Spike) to extend transition time correctly.")
 
     show_debug = st.sidebar.checkbox("Show Debug Info", value=False)
 
@@ -459,11 +474,11 @@ def main():
         
         try:
             bar = st.progress(0)
-            st.write("Step 1: Extraction (Flow Vectors)...")
+            st.write("Step 1: Extraction (Multi-Template)...")
             df, fps, w, h = extract_telemetry(tfile.name, bar.progress)
             
-            st.write("Step 2: Analysis (Fy Movement Logic)...")
-            pit_t, tire_t, fuel_t, corners, df_final = analyze_states_v52(df, fps)
+            st.write("Step 2: Analysis...")
+            pit_t, tire_t, fuel_t, corners, df_final = analyze_states_v53(df, fps)
             
             if pit_t[0] is None:
                 st.error("Could not detect Stop.")
@@ -517,7 +532,7 @@ def main():
         with c2:
             if os.path.exists(vid_path):
                 with open(vid_path, 'rb') as f:
-                    st.download_button("Download MP4", f, file_name="pitstop_v52.mp4")
+                    st.download_button("Download MP4", f, file_name="pitstop_v53.mp4")
 
 if __name__ == "__main__":
     main()
